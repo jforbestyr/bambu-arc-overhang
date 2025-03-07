@@ -24,7 +24,10 @@ Run the script using the full path to both Python and the script:
 - **PrusaSlicer**: Go to **Print Settings → Output Options → Post-processing Scripts**.
 - **OrcaSlicer**: Enable **Advanced Mode**, then navigate to **Others → Post-processing Scripts**.
 
-Enter the full path to your Python executable followed by the script path, just like in the command line example above.
+Enter the full path to your Python executable followed by the script path.
+```sh
+"C:\path\to\python.exe" "C:\path\to\arc_overhangs_v1.0.0.py"
+```
 
 ## 📌 Requirements
 - **Python** 3.10+
