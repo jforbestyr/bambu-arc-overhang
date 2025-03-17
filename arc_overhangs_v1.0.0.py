@@ -99,6 +99,68 @@ max=max
 min=min
 len=len
 
+########## Parameters  - adjust values here as needed ##########
+def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
+    """Merge two dictionaries and set some keys/values explicitly."""
+    # The slicer settings will be imported from GCode. However, some are Arc-specific and need to be adapted by you.
+    AddManualSettingsDict: dict[str, Any] = {
+        # Adapt these settings as needed for your specific geometry/printer:
+        "AllowedArcRetries": 2,  # Tries at slightly different points if arc generation fails.
+        "CheckForAllowedSpace": False,  # Use the following x&y filter or not
+        "AllowedSpaceForArcs": Polygon([[0, 0], [500, 0], [500, 500], [0, 500]]),  # Control in which areas Arcs shall be generated
+        "ArcCenterOffset": 1.5 * gCodeSettingDict.get("nozzle_diameter"),  # Unit: mm, prevents very small Arcs by hiding the center in not printed section. Make 0 to get into tricky spots with smaller arcs.
+        "ArcExtrusionMultiplier": 1.35, # Multiplies how much filament will be extruded while printing arcs.
+        "ArcFanSpeed": 255,  # Cooling to full blast = 255
+        "ArcMinPrintSpeed": 0.5 * 60,  # Unit: mm/min
+        "ArcPrintSpeed": 1.5 * 60,  # Unit: mm/min
+        "ArcSlowDownBelowThisDuration": 3,  # Arc Time below this Duration => slow down, Unit: sec
+        "ArcPointsPerMillimeter": 10,  # Higher will slow down the code but give better support for following arcs. Recommended values: >=10 when "UseLeastAmountOfCenterPoints": False; else, value can be as low as 1.
+        "ArcTravelFeedRate": 30 * 60,  # Slower travel speed, Unit: mm/min
+        "ArcWidth": gCodeSettingDict.get("nozzle_diameter") * 0.95,  # Change the spacing between the arcs, should be nozzle_diameter
+        "CornerImportanceMultiplier": 0.2,  # Startpoint for Arc generation is chosen close to the middle of the StartLineString and at a corner. Higher => Corner selection more important.
+        "DistanceBetweenPointsOnStartLine": 0.1,  # Used for redistribution, if start fails.
+        "ExtendArcDist": gCodeSettingDict.get("nozzle_diameter"),  # Extend Arcs perpendicularly for better bonding between them. Unit: mm
+        "ExtendArcsIntoPerimeter": 0.5 * gCodeSettingDict.get("extrusion_width"),  # Min = 0.5 extrusion width!, extends the Area for arc generation, put higher to go through small passages. Unit: mm
+        "ExtendHilbertIntoPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Extends the Area for Hilbert curve generation, put higher to go through small passages. Unit: mm
+        "GCodeArcPtMinDist": 0.1,  # Min distance between points on the Arcs to form separate GCode Command. Unit: mm
+        "HilbertFillingPercentage": 100,  # Infill percentage of the massive layers with special cooling.
+        "HilbertInfillExtrusionMultiplier": 1.05, # Multiplies how much filament will be extruded while printing Hilbert curves.
+        "HilbertTravelEveryNSeconds": 6,  # When N seconds are driven, it will continue printing somewhere else (very rough approx).
+        "MinArea": 0,  # Minimum overhang area to generate arcs. Unit: mm²
+        "MinBridgeLength": 0,  # Minimum bridge length to generate arcs. Unit: mm
+        "MinDistanceFromPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Control how much bumpiness you allow between arcs and perimeter. Lower will follow perimeter better, but create a lot of very small arcs. Should be more than 1 Arc width! Unit: mm
+        "MinStartArcs": 2,  # How many arcs shall be generated in the first step
+        "Path2Output": r"",  # Leave empty to overwrite the file or write to a new file. Full path required.
+        "RMax": 30,  # The max radius of the arcs.
+        "ReplaceInternalBridging": True, # If true, will replace bridging that goes over external perimeters but does not have overhang perimeters nearby.
+        "SafetyBreak_MaxArcNumber": 2000,  # Max Number of Arc Start Points. Prevents While loop from running forever.
+        "TimeLapseEveryNArcs": 0,  # Deactivate with 0, inserts M240 after N ArcLines, 5 is a good value to start.
+        "UseLeastAmountOfCenterPoints": False,  # Always generates arcs until rMax is reached, divide the arcs into pieces if needed. Reduces the amount of center points.
+        "WarnBelowThisFillingPercentage": 90,  # Fill the overhang at least XX%, else don't replace overhang. Easier detection of errors in small/delicate areas. Unit: Percent
+
+        # Special cooling to prevent warping:
+        "aboveArcsFanSpeed": 25,  # 0 -> 255, 255 = 100%
+        "aboveArcsInfillPrintSpeed": 10 * 60,  # Unit: mm/min
+        "aboveArcsPerimeterFanSpeed": 25,  # 0 -> 255, 255 = 100%
+        "aboveArcsPerimeterPrintSpeed": 3 * 60,  # Unit: mm/min
+        "applyAboveFanSpeedToWholeLayer": True,
+        "CoolingSettingDetectionDistance": 3,  # If the GCode line is closer than this distance to an infill polygon, the cooling settings will be applied. Unit: mm
+        "doSpecialCooling": True,  # Use to enable/disable Hilbert curves and slower movement above arc overhangs. Should be `True` to prevent warping
+        "specialCoolingZdist": 3,  # Use the special cooling XX mm above the arcs.
+
+        # Settings for easier debugging:
+        "plotArcsEachStep": False,  # Plot arcs for every filled polygon. Use for debugging.
+        "plotArcsFinal": False,  # Plot arcs for every filled polygon, when completely filled. Use for debugging.
+        "plotDetectedInfillPoly": False,  # Plot each detected overhang polygon. Use for debugging.
+        "plotDetectedSolidInfillPoly": False,  # Plot each solid infill polygon. Use for debugging.
+        "plotEachHilbert": False,  # Plot each generated Hilbert curve. Use for debugging.
+        "plotStart": False,  # Plot the detected geometry in the previous layer and the StartLine for Arc-Generation. Use for debugging.
+        "PrintDebugVerification": False  # Used for console logging of the process.
+    }
+
+    gCodeSettingDict.update(AddManualSettingsDict)
+    return gCodeSettingDict
+
 slicer: str = None
 
 # If you add a new slicer, please submit a pull request!
@@ -213,68 +275,6 @@ def getSlicerSpecificName(name: str):
         return name
     return _EQUIVALENT_NAMES.get(slicer).get(name, name)
 
-########## Parameters  - adjust values here as needed ##########
-def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
-    """Merge two dictionaries and set some keys/values explicitly."""
-    # The slicer settings will be imported from GCode. However, some are Arc-specific and need to be adapted by you.
-    AddManualSettingsDict: dict[str, Any] = {
-        # Adapt these settings as needed for your specific geometry/printer:
-        "AllowedArcRetries": 2,  # Tries at slightly different points if arc generation fails.
-        "CheckForAllowedSpace": False,  # Use the following x&y filter or not
-        "AllowedSpaceForArcs": Polygon([[0, 0], [500, 0], [500, 500], [0, 500]]),  # Control in which areas Arcs shall be generated
-        "ArcCenterOffset": 1.5 * gCodeSettingDict.get("nozzle_diameter"),  # Unit: mm, prevents very small Arcs by hiding the center in not printed section. Make 0 to get into tricky spots with smaller arcs.
-        "ArcExtrusionMultiplier": 1.35, # Multiplies how much filament will be extruded while printing arcs.
-        "ArcFanSpeed": 255,  # Cooling to full blast = 255
-        "ArcMinPrintSpeed": 0.5 * 60,  # Unit: mm/min
-        "ArcPrintSpeed": 1.5 * 60,  # Unit: mm/min
-        "ArcSlowDownBelowThisDuration": 3,  # Arc Time below this Duration => slow down, Unit: sec
-        "ArcPointsPerMillimeter": 10,  # Higher will slow down the code but give better support for following arcs. Recommended values: >=10 when "UseLeastAmountOfCenterPoints": False; else, value can be as low as 1.
-        "ArcTravelFeedRate": 30 * 60,  # Slower travel speed, Unit: mm/min
-        "ArcWidth": gCodeSettingDict.get("nozzle_diameter") * 0.95,  # Change the spacing between the arcs, should be nozzle_diameter
-        "CornerImportanceMultiplier": 0.2,  # Startpoint for Arc generation is chosen close to the middle of the StartLineString and at a corner. Higher => Corner selection more important.
-        "DistanceBetweenPointsOnStartLine": 0.1,  # Used for redistribution, if start fails.
-        "ExtendArcDist": gCodeSettingDict.get("nozzle_diameter"),  # Extend Arcs perpendicularly for better bonding between them. Unit: mm
-        "ExtendArcsIntoPerimeter": 0.5 * gCodeSettingDict.get("extrusion_width"),  # Min = 0.5 extrusion width!, extends the Area for arc generation, put higher to go through small passages. Unit: mm
-        "ExtendHilbertIntoPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Extends the Area for Hilbert curve generation, put higher to go through small passages. Unit: mm
-        "GCodeArcPtMinDist": 0.1,  # Min distance between points on the Arcs to form separate GCode Command. Unit: mm
-        "HilbertFillingPercentage": 100,  # Infill percentage of the massive layers with special cooling.
-        "HilbertInfillExtrusionMultiplier": 1.05, # Multiplies how much filament will be extruded while printing Hilbert curves.
-        "HilbertTravelEveryNSeconds": 6,  # When N seconds are driven, it will continue printing somewhere else (very rough approx).
-        "MinArea": 0,  # Minimum overhang area to generate arcs. Unit: mm²
-        "MinBridgeLength": 0,  # Minimum bridge length to generate arcs. Unit: mm
-        "MinDistanceFromPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Control how much bumpiness you allow between arcs and perimeter. Lower will follow perimeter better, but create a lot of very small arcs. Should be more than 1 Arc width! Unit: mm
-        "MinStartArcs": 2,  # How many arcs shall be generated in the first step
-        "Path2Output": r"",  # Leave empty to overwrite the file or write to a new file. Full path required.
-        "RMax": 30,  # The max radius of the arcs.
-        "ReplaceInternalBridging": True, # If true, will replace bridging that goes over external perimeters but does not have overhang perimeters nearby.
-        "SafetyBreak_MaxArcNumber": 2000,  # Max Number of Arc Start Points. Prevents While loop from running forever.
-        "TimeLapseEveryNArcs": 0,  # Deactivate with 0, inserts M240 after N ArcLines, 5 is a good value to start.
-        "UseLeastAmountOfCenterPoints": False,  # Always generates arcs until rMax is reached, divide the arcs into pieces if needed. Reduces the amount of center points.
-        "WarnBelowThisFillingPercentage": 90,  # Fill the overhang at least XX%, else don't replace overhang. Easier detection of errors in small/delicate areas. Unit: Percent
-
-        # Special cooling to prevent warping:
-        "aboveArcsFanSpeed": 25,  # 0 -> 255, 255 = 100%
-        "aboveArcsInfillPrintSpeed": 10 * 60,  # Unit: mm/min
-        "aboveArcsPerimeterFanSpeed": 25,  # 0 -> 255, 255 = 100%
-        "aboveArcsPerimeterPrintSpeed": 3 * 60,  # Unit: mm/min
-        "applyAboveFanSpeedToWholeLayer": True,
-        "CoolingSettingDetectionDistance": 3,  # If the GCode line is closer than this distance to an infill polygon, the cooling settings will be applied. Unit: mm
-        "doSpecialCooling": True,  # Use to enable/disable Hilbert curves and slower movement above arc overhangs. Should be `True` to prevent warping
-        "specialCoolingZdist": 3,  # Use the special cooling XX mm above the arcs.
-
-        # Settings for easier debugging:
-        "plotArcsEachStep": False,  # Plot arcs for every filled polygon. Use for debugging.
-        "plotArcsFinal": False,  # Plot arcs for every filled polygon, when completely filled. Use for debugging.
-        "plotDetectedInfillPoly": False,  # Plot each detected overhang polygon. Use for debugging.
-        "plotDetectedSolidInfillPoly": False,  # Plot each solid infill polygon. Use for debugging.
-        "plotEachHilbert": False,  # Plot each generated Hilbert curve. Use for debugging.
-        "plotStart": False,  # Plot the detected geometry in the previous layer and the StartLine for Arc-Generation. Use for debugging.
-        "PrintDebugVerification": False  # Used for console logging of the process.
-    }
-
-    gCodeSettingDict.update(AddManualSettingsDict)
-    return gCodeSettingDict
-
 ################################# MAIN FUNCTION #################################
 #################################################################################
 #at the top, for better reading
@@ -315,6 +315,8 @@ def main(gCodeFileStream, path2GCode) -> None:
             layer.spotBridgeInfill()
             layer.makePolysFromBridgeInfill(extend=parameters.get("ExtendArcsIntoPerimeter", 1))
             layer.polys = layer.mergePolys()
+            if parameters.get("ReplaceInternalBridging", False):
+                layer.indexOverhangPerimeters()
             layer.verifyinfillpolys(prevLayer=prevLayer, maxDistForValidation=2 * parameters.get("perimeter_extrusion_width"))
 
             # ARC GENERATION
@@ -510,6 +512,7 @@ def main(gCodeFileStream, path2GCode) -> None:
                     modifiedlayer.lines.append(f"M106 S{layer.fansetting:.0f}\n")
                     messedWithFan = False
                 modifiedlayer.extract_features()
+                modifiedlayer.indexedOverhangPerimeters = layer.indexedOverhangPerimeters
                 layerobjs[idl] = modifiedlayer  # Overwrite the infos
     
     if gcodeWasModified:
@@ -666,6 +669,7 @@ class Layer():
         self.features=[]
         self.oldpolys=[]
         self.indexedOldPolys=STRtree([])
+        self.indexedOverhangPerimeters=STRtree([])
         self.solidPolys=[]
         self.dontPerformPerimeterCheck=kwargs.get('notPerformPerimeterCheck',False)
         self.deleteTheseInfills=[]
@@ -686,6 +690,12 @@ class Layer():
         for poly in self.oldpolys:
             prepare(poly)  # Prepare polygons for faster operations
         self.indexedOldPolys = STRtree(self.oldpolys)  # Create an STR-tree index
+
+    def indexOverhangPerimeters(self):
+        overhangs = self.getOverhangPerimeterLineStrings()
+        for ls in overhangs:
+            prepare(ls)
+        self.indexedOverhangPerimeters = STRtree(self.getOverhangPerimeterLineStrings())
 
     def extract_features(self) -> None:
         """Extract features (e.g., perimeter, infill) from G-code lines."""
@@ -983,10 +993,10 @@ class Layer():
 
     def verifyinfillpolys(self, prevLayer, maxDistForValidation: float = 0.5) -> None:
         """Verify infill polygons by checking their proximity to overhangs and other criteria."""
-        overhangs = self.getOverhangPerimeterLineStrings()  # Get overhang perimeters
-        if len(overhangs) > 0 or self.parameters.get("ReplaceInternalBridging"):
+        overhangs = self.indexedOverhangPerimeters  # Get overhang perimeters
+        if len(overhangs.geometries) > 0 or self.parameters.get("ReplaceInternalBridging"):
             if self.parameters.get("PrintDebugVerification"):
-                print(f"Layer {self.layernumber}: {len(overhangs)} Overhangs found")
+                print(f"Layer {self.layernumber}: {len(overhangs.geometries)} Overhangs found")
             
             if not self.allowedSpacePolygon:
                 input(f"Layer {self.layernumber}: no allowed space Polygon provided to layer obj, unable to run script. Press Enter.")
@@ -1012,20 +1022,32 @@ class Layer():
                     continue  # Skip polygons with insufficient area
                 
                 verified = False
-                indexedOverhangPerimeters = STRtree(overhangs)
-                prevLayer.makeExternalPerimeter2Polys()
+                if len(prevLayer.extPerimeterPolys) == 0:
+                    prevLayer.makeExternalPerimeter2Polys()
                 indexedExtPerimeters = STRtree(prevLayer.extPerimeterPolys)
-                dists = indexedOverhangPerimeters.query_nearest(poly, maxDistForValidation, return_distance=True)[1]
-                overlappers = indexedExtPerimeters.query(poly, predicate="overlaps")
+                prevIndexedOverhangPerimeters = prevLayer.indexedOverhangPerimeters
+
+                dists = overhangs.query_nearest(poly, maxDistForValidation, return_distance=True)[1]
+                extIntersectors = indexedExtPerimeters.query(poly)
+                overIntersectors = prevIndexedOverhangPerimeters.query(poly)
                 for dist in dists:
                     if dist < maxDistForValidation:  # Check if this poly is close to an overhang
                         verified = True
                         break
                 if not verified and self.parameters.get("ReplaceInternalBridging"):
-                    for overlap in overlappers:
-                        if overlaps(poly, prevLayer.extPerimeterPolys[overlap]):  # Check if this poly hangs over an edge
+                    for intersectId in extIntersectors:
+                        if intersects(poly, indexedExtPerimeters.geometries[intersectId]):  # Check if this poly hangs over an edge
                             verified = True
                             break
+                    for intersectId in overIntersectors:
+                        if intersects(poly, prevIndexedOverhangPerimeters.geometries[intersectId]):
+                            verified = True
+                            break
+                    # for geom in prevLayer.getOverhangPerimeterLineStrings():
+                    #     plot_geometry(geom, 'b')
+                    # plot_geometry(poly)
+                    # plt.axis('square')
+                    # plt.show()
                 if verified:
                     self.validpolys.append(poly)  # Mark polygon as valid
                     self.deleteTheseInfills.append(idp)  # Mark for deletion
