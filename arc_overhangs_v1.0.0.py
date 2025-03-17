@@ -69,8 +69,8 @@ from shapely import (
     Polygon,
     LineString,
     MultiLineString,
+    covers,
     difference,
-    overlaps,
     points,
     prepare,
     destroy_prepared,
@@ -1030,7 +1030,7 @@ class Layer():
                 prevIndexedOverhangPerimeters = prevLayer.indexedOverhangPerimeters
 
                 dists = overhangs.query_nearest(poly, maxDistForValidation, return_distance=True)[1]
-                extOverlappers = indexedExtPerimeters.query(poly, predicate="overlaps")
+                extOverlappers = indexedExtPerimeters.query(poly)
                 overIntersectors = prevIndexedOverhangPerimeters.query(poly)
                 for dist in dists:
                     if dist < maxDistForValidation:  # Check if this poly is close to an overhang
@@ -1038,7 +1038,7 @@ class Layer():
                         break
                 if not verified and self.parameters.get("ReplaceInternalBridging"):
                     for intersectId in extOverlappers:
-                        if overlaps(poly, indexedExtPerimeters.geometries[intersectId]):  # Check if this poly hangs over an edge
+                        if intersects(indexedExtPerimeters.geometries[intersectId], poly) and not covers(indexedExtPerimeters.geometries[intersectId], poly):  # Check if this poly hangs over an edge
                             verified = True
                             break
                     for intersectId in overIntersectors:
