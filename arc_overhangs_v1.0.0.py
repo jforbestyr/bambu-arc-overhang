@@ -429,7 +429,8 @@ def main(gCodeFileStream, path2GCode) -> None:
                 print("oldpolys found in layer:", idl)
                 layer.spotSolidInfill()
                 layer.makePolysFromSolidInfill(extend=parameters.get("ExtendHilbertIntoPerimeter"))
-                layer.solidPolys = layer.mergePolys(layer.solidPolys)
+                if len(layer.solidPolys) > 1:
+                    layer.solidPolys = layer.mergePolys(layer.solidPolys)
                 allhilbertpts = []
                 for poly in layer.solidPolys:
                     prepare(poly)
@@ -950,6 +951,7 @@ class Layer():
                 plot_geometry(self.solidPolys)  # Plot the polygon
                 plot_geometry(self.sinfills, "g")  # Plot the LineString in green
                 plt.axis('square')
+                plt.title('Detected Solid Infill Polys')
                 plt.show()
 
     def verifySolidInfillPts(self, infillpts: list) -> bool:
@@ -1028,29 +1030,25 @@ class Layer():
                 prevIndexedOverhangPerimeters = prevLayer.indexedOverhangPerimeters
 
                 dists = overhangs.query_nearest(poly, maxDistForValidation, return_distance=True)[1]
-                extIntersectors = indexedExtPerimeters.query(poly)
+                extOverlappers = indexedExtPerimeters.query(poly, predicate="overlaps")
                 overIntersectors = prevIndexedOverhangPerimeters.query(poly)
                 for dist in dists:
                     if dist < maxDistForValidation:  # Check if this poly is close to an overhang
                         verified = True
                         break
                 if not verified and self.parameters.get("ReplaceInternalBridging"):
-                    for intersectId in extIntersectors:
-                        if intersects(poly, indexedExtPerimeters.geometries[intersectId]):  # Check if this poly hangs over an edge
+                    for intersectId in extOverlappers:
+                        if overlaps(poly, indexedExtPerimeters.geometries[intersectId]):  # Check if this poly hangs over an edge
                             verified = True
                             break
                     for intersectId in overIntersectors:
-                        if intersects(poly, prevIndexedOverhangPerimeters.geometries[intersectId]):
+                        if intersects(poly, prevIndexedOverhangPerimeters.geometries[intersectId]):  # Check if this poly intersects an overhang
                             verified = True
                             break
-                    # for geom in prevLayer.getOverhangPerimeterLineStrings():
-                    #     plot_geometry(geom, 'b')
-                    # plot_geometry(poly)
-                    # plt.axis('square')
-                    # plt.show()
                 if verified:
                     self.validpolys.append(poly)  # Mark polygon as valid
                     self.deleteTheseInfills.append(idp)  # Mark for deletion
+                    continue
                 
                 if self.parameters.get("PrintDebugVerification"):
                     print(f"Layer {self.layernumber}: Poly{idp} is not close enough to overhang perimeters")
