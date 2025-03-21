@@ -1,3 +1,6 @@
+> [!NOTE]
+> Version 1.0.0 is almost here! Please test the script and leave feedback in [Discussions](https://github.com/Wasupmacuz/arc-overhang-prusaslicer-integration/discussions).  
+> **Most important**: tweak parameters and report what works and what doesn't.
 # Arc Overhangs - PrusaSlicer & OrcaSlicer Integration
 
 <p align="center">
