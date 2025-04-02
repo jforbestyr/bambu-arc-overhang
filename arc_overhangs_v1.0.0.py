@@ -49,6 +49,7 @@ KNOWN ISSUES:
 import sys
 import argparse
 import re
+import traceback
 from typing import Any, List, Tuple
 from math import (
     log2,
@@ -1810,6 +1811,14 @@ if __name__ == "__main__":
     skipInput = args.skip_input or platform.system() != "Windows"
 
     # Call the main function with the arguments
-    main(gCodeFileStream, path2GCode)
-    if not skipInput:
-        input("Press enter to exit.")
+    exitCode = 0
+    try:
+        main(gCodeFileStream, path2GCode)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Error: {str(e)}.")
+        exitCode = 1
+    finally:
+        if not skipInput:
+            input("Press enter to exit.")
+        sys.exit(exitCode)
