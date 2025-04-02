@@ -119,6 +119,8 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "ArcFanSpeed": 255,  # Cooling to full blast = 255
         "ArcMinPrintSpeed": 0.5 * 60,  # Unit: mm/min
         "ArcPrintSpeed": 1.5 * 60,  # Unit: mm/min
+        "UseCustomArcTemp": False, # Set to True to use a custom arc printing temperature
+        "CustomArcTemp": 200, # The temperature (in °C) to wait for before printing arcs
         "ArcSlowDownBelowThisDuration": 3,  # Arc Time below this Duration => slow down, Unit: sec
         "ArcPointsPerMillimeter": 10,  # Higher will slow down the code but give better support for following arcs. Recommended values: >=10 when "UseLeastAmountOfCenterPoints": False; else, value can be as low as 1.
         "ArcTravelFeedRate": 30 * 60,  # Slower travel speed, Unit: mm/min
@@ -223,6 +225,7 @@ _SLICER_SETTINGS_MAP = {
         "retract_length": "retract_length",
         'retract_speed': 'retract_speed',
         "solid_infill_extrusion_width": "solid_infill_extrusion_width",
+        'temperature': 'temperature',
         'travel_speed': 'travel_speed',
         'use_relative_e_distances': 'use_relative_e_distances',
     },
@@ -242,6 +245,7 @@ _SLICER_SETTINGS_MAP = {
         "retraction_length": "retract_length",
         'retraction_speed': 'retract_speed',
         "internal_solid_infill_line_width": "solid_infill_extrusion_width",
+        'nozzle_temperature': 'temperature',
         'travel_speed': 'travel_speed',
         'use_relative_e_distances': 'use_relative_e_distances',
     },
@@ -468,6 +472,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                         if ";TYPE" in line and not isInjected:  # Inject arcs at the very start
                             injectionStart = idline
                             modifiedlayer.lines.append(";TYPE:Arc infill\n")
+                            if parameters.get("UseCustomArcTemp", False):
+                                # Wait for the custom temperature before beginning arcs.
+                                modifiedlayer.lines.append(f"M109 S{parameters.get('CustomArcTemp')} ; Wait for custom arc temp\n")
                             modifiedlayer.lines.append(f"M106 S{parameters.get('ArcFanSpeed')}\n")
                             for overhangline in arcOverhangGCode:
                                 for arcline in overhangline:
@@ -481,6 +488,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                                     modifiedlayer.lines.append(line2TravelMove(layer.lines[id], parameters, ignoreZ=True))  # Travel
                                     modifiedlayer.lines.append(retractGCode(retract=False, kwargs=parameters))  # Extrude
                                     break
+                            if parameters.get("UseCustomArcTemp", False):
+                                # Restore the normal temperature after arcs are printed.
+                                modifiedlayer.lines.append(f"M109 S{parameters.get(getSlicerSpecificName("temperature"))} ; Restore normal temperature\n")
                     if layer.oldpolys and parameters.get("doSpecialCooling"):
                         if getSlicerSpecificName(";TYPE:Solid infill") in line and not hilbertIsInjected:  # Startpoint of solid infill: print all hilberts from here.
                             hilbertIsInjected = True
