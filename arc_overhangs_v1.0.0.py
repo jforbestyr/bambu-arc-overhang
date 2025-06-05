@@ -208,6 +208,7 @@ Translates the settings from the slicer in use to the value used by PrusaSlicer.
 - Slicer name:
     - Key (left side of ':') the name used by the new slicer.
     - Value (right side of ':') the name used by PrusaSlicer.
+    Note that this is opposite from _EQUVALENT_NAMES.
 """
 _SLICER_SETTINGS_MAP = {
     'PrusaSlicer': {
@@ -257,7 +258,7 @@ Translates the slicer's GCode annotations to those used by PrusaSlicer.
 - Slicer name:
     - Key (left side of ':') is the name in PrusaSlicer.
     - Value (right side of ':') is the name is the new slicer.
-Note that this is opposite from _SLICER_SETTINGS_MAP.
+    Note that this is opposite from _SLICER_SETTINGS_MAP.
 """
 _EQUIVALENT_NAMES = {
     "PrusaSlicer": {
@@ -281,7 +282,7 @@ _EQUIVALENT_NAMES = {
     # Add mappings for other slicers
 }
 def getSlicerSpecificName(name: str):
-    if slicer == "PrusaSlicer":  # No need to map in this case, but the mapping is left to help contributors translate their own slicer.
+    if slicer == "PrusaSlicer":  # No need to map in this case, but the mapping above is left to help contributors translate their own slicer.
         return name
     return _EQUIVALENT_NAMES.get(slicer).get(name, name)
 
