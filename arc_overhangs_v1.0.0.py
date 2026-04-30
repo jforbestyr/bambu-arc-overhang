@@ -138,6 +138,7 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "MinBridgeLength": 0,  # Minimum bridge length to generate arcs. Unit: mm
         "MinDistanceFromPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Control how much bumpiness you allow between arcs and perimeter. Lower will follow perimeter better, but create a lot of very small arcs. Should be more than 1 Arc width! Unit: mm
         "BridgePolyClosingRadius": 1.0, # mm. Closing operation radius applied to each bridge polygon. Merges adjacent buffered gcode lines so the BFS sees the bridge's full surface (independent of the slicer's chosen infill direction/spacing). 0 to disable.
+        "PreserveBridgeInUnfilled": True, # If true, re-emit original bridge gcode in any region of a converted bridge that the arc BFS failed to fill. Removing supporting bridge is never desired.
         "MinFillRatioToReplace": 0.0, # If >0 and the BFS fills less than this fraction of a bridge's area, the bridge is rejected (its gcode is kept, no arcs injected). Prevents leaving thin sections without support when arcs can't reach them.
         "MinStartArcs": 2,  # How many arcs shall be generated in the first step
         "OnlyBridgesSupportingTopSurfaces": False, # If true, only convert bridges that are below a stack of internal solid infill capped by a top surface (within BridgeSupportLookAheadZ above).
@@ -375,10 +376,20 @@ def main(gCodeFileStream, path2GCode) -> None:
     gcodeWasModified = False
     numOverhangs = 0
     lastfansetting = 0
-    # Coverage diagnostics: track total bridge area we converted vs how much of it
-    # the BFS actually filled with arcs. The leftover is "unsupported" — bridge gcode
-    # got deleted but no arcs replaced it there, so the layer above has nothing to sit on.
-    coverageStats = {"totalBridgeArea": 0.0, "totalUnfilledArea": 0.0, "perLayer": []}
+    # Coverage diagnostics. Three buckets:
+    #   - arcFilledArea: bridge area replaced by arcs.
+    #   - preservedBridgeArea: bridge area kept as original bridge gcode (in unfilled
+    #     regions where PreserveBridgeInUnfilled re-emitted the original lines).
+    #   - trulyUnsupportedArea: bridge area not covered by arcs OR preserved bridge.
+    #     This is the only bucket that means "layer above will droop here". Should be
+    #     near zero with default settings.
+    coverageStats = {
+        "totalBridgeArea": 0.0,
+        "arcFilledArea": 0.0,
+        "preservedBridgeArea": 0.0,
+        "trulyUnsupportedArea": 0.0,
+        "perLayer": [],
+    }
     
     layers = splitGCodeIntoLayers(gcode=gCodeLines)
     gCodeFileStream.close()
@@ -460,8 +471,7 @@ def main(gCodeFileStream, path2GCode) -> None:
                         warnings.warn("Skipping Polygon because no StartLine Found")
                         layer.failedArcGenPolys.append(poly)
                         coverageStats["totalBridgeArea"] += poly.area
-                        coverageStats["totalUnfilledArea"] += poly.area
-                        coverageStats["perLayer"].append((idl, poly.area, poly.area))
+                        coverageStats["preservedBridgeArea"] += poly.area
                         continue
                     prepare(boundaryWithOutStartLine)
                     startpt = getStartPtOnLS(startLineString, parameters)
@@ -490,8 +500,7 @@ def main(gCodeFileStream, path2GCode) -> None:
                                 warnings.warn("Initialization Error: no concentric Arc could be generated at startpoints, moving on")
                                 layer.failedArcGenPolys.append(poly)
                                 coverageStats["totalBridgeArea"] += poly.area
-                                coverageStats["totalUnfilledArea"] += poly.area
-                                coverageStats["perLayer"].append((idl, poly.area, poly.area))
+                                coverageStats["preservedBridgeArea"] += poly.area
                                 continue
                     destroy_prepared(boundaryWithOutStartLine)
                     arcBoundaries = getArcBoundaries(concentricArcs)
@@ -510,8 +519,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                     arcs4gcode.extend(arcBoundaries)
 
                     # Poly finished — record coverage diagnostics
-                    unfilledArea = max(0.0, poly.area - finalFilledSpace.area)
-                    fillRatio = (finalFilledSpace.area / poly.area) if poly.area > 0 else 1.0
+                    arcFilledHere = min(finalFilledSpace.area, poly.area)
+                    unfilledArea = max(0.0, poly.area - arcFilledHere)
+                    fillRatio = (arcFilledHere / poly.area) if poly.area > 0 else 1.0
                     minFillRatio = parameters.get("MinFillRatioToReplace", 0.0)
                     if minFillRatio > 0 and fillRatio < minFillRatio:
                         # Reject this poly: keep its bridge gcode, drop the generated arcs.
@@ -519,11 +529,35 @@ def main(gCodeFileStream, path2GCode) -> None:
                         # so this bridge stays intact (supported as bridge, just no arcs).
                         print(f"layer {idl}: rejecting poly (fill ratio {fillRatio*100:.0f}% < {minFillRatio*100:.0f}% threshold) — bridge gcode preserved")
                         layer.failedArcGenPolys.append(poly)
-                        arcs4gcode = []  # discard generated arcs for this poly
+                        coverageStats["totalBridgeArea"] += poly.area
+                        coverageStats["preservedBridgeArea"] += poly.area
+                        arcs4gcode = []
                         continue
+                    # Compute how much of the unfilled region is actually covered by the
+                    # original bridge gcode footprint (so it's preserved by re-emit), vs
+                    # truly unsupported (no arcs, no bridge).
+                    preservedHere = 0.0
+                    if parameters.get("PreserveBridgeInUnfilled", True) and unfilledArea > 0.0:
+                        unfilledRegion = difference(poly, finalFilledSpace)
+                        if not unfilledRegion.is_empty:
+                            extW = float(parameters.get("extrusion_width", 0.4) or 0.4)
+                            footprints = []
+                            for bInfill in layer.binfills:
+                                if len(bInfill.pts) < 2:
+                                    continue
+                                bls = LineString(bInfill.pts)
+                                if bls.intersects(poly):
+                                    footprints.append(buffer(bls, extW * 0.5))
+                            if footprints:
+                                bridgeFootprint = unary_union(footprints)
+                                preservedHere = bridgeFootprint.intersection(unfilledRegion).area
+                                preservedHere = min(preservedHere, unfilledArea)
+                    trulyUnsupportedHere = max(0.0, unfilledArea - preservedHere)
                     coverageStats["totalBridgeArea"] += poly.area
-                    coverageStats["totalUnfilledArea"] += unfilledArea
-                    coverageStats["perLayer"].append((idl, poly.area, unfilledArea))
+                    coverageStats["arcFilledArea"] += arcFilledHere
+                    coverageStats["preservedBridgeArea"] += preservedHere
+                    coverageStats["trulyUnsupportedArea"] += trulyUnsupportedHere
+                    coverageStats["perLayer"].append((idl, poly.area, trulyUnsupportedHere))
                     remain2FillPercent = (1 - finalFilledSpace.area / poly.area) * 100
                     if remain2FillPercent > 100 - parameters.get("WarnBelowThisFillingPercentage"):
                         # layer.failedArcGenPolys.append(poly) # Percentage detection not reliable TODO
@@ -542,6 +576,26 @@ def main(gCodeFileStream, path2GCode) -> None:
                             if parameters.get("TimeLapseEveryNArcs") > 0:
                                 if ida % parameters.get("TimeLapseEveryNArcs"):
                                     arcOverhangGCode.append("M240\n")
+
+                    # Preserve original bridge gcode wherever the BFS couldn't fill.
+                    # Removing supporting bridge is never desired — for any unfilled
+                    # region inside this poly, intersect the original bridge LineString
+                    # with the unfilled region and re-emit those segments as gcode.
+                    if parameters.get("PreserveBridgeInUnfilled", True) and unfilledArea > 0.5:
+                        unfilledRegion = difference(poly, finalFilledSpace)
+                        if not unfilledRegion.is_empty:
+                            for bInfill in layer.binfills:
+                                if len(bInfill.pts) < 2:
+                                    continue
+                                bridgeLS = LineString(bInfill.pts)
+                                if not bridgeLS.intersects(poly):
+                                    continue
+                                kept = bridgeLS.intersection(unfilledRegion)
+                                if kept.is_empty:
+                                    continue
+                                bridgeFill = preservedBridgeGCode(kept, parameters)
+                                if bridgeFill:
+                                    arcOverhangGCode.append(bridgeFill)
 
                     modify = True
                     gcodeWasModified = True
@@ -645,23 +699,33 @@ def main(gCodeFileStream, path2GCode) -> None:
                 modifiedlayer.indexedOverhangPerimeters = layer.indexedOverhangPerimeters
                 layerobjs[idl] = modifiedlayer  # Overwrite the infos
     
-    # Coverage diagnostic: how much of the bridge area we converted now lacks any
-    # arc support (bridge gcode deleted but BFS couldn't fill it).
+    # Coverage diagnostic. Splits the converted bridge area into three buckets so
+    # users can tell apart "covered by arcs", "kept as bridge gcode", and the only
+    # bucket that means trouble: "no arcs AND no preserved bridge".
     if coverageStats["totalBridgeArea"] > 0:
         bridge = coverageStats["totalBridgeArea"]
-        unfilled = coverageStats["totalUnfilledArea"]
-        pct = (unfilled / bridge) * 100 if bridge > 0 else 0
-        print(f"Coverage: {bridge:.0f} mm^2 of bridges converted, {unfilled:.0f} mm^2 unsupported ({pct:.1f}%)")
+        arc = coverageStats["arcFilledArea"]
+        preserved = coverageStats["preservedBridgeArea"]
+        unsup = coverageStats["trulyUnsupportedArea"]
+        pa = (arc / bridge * 100) if bridge > 0 else 0
+        pp = (preserved / bridge * 100) if bridge > 0 else 0
+        pu = (unsup / bridge * 100) if bridge > 0 else 0
+        print(
+            f"Coverage: {bridge:.0f} mm^2 of bridges -> "
+            f"{arc:.0f} arc-filled ({pa:.1f}%), "
+            f"{preserved:.0f} preserved as bridge ({pp:.1f}%), "
+            f"{unsup:.0f} truly unsupported ({pu:.1f}%)"
+        )
         offenders = sorted(
             (e for e in coverageStats["perLayer"] if e[2] > 0.5),
             key=lambda e: e[2],
             reverse=True,
         )[:10]
         if offenders:
-            print("  Layers with unfilled area > 0.5 mm^2 (worst first):")
-            for layer_idx, total_area, unfilled_area in offenders:
-                pct_layer = (unfilled_area / total_area * 100) if total_area > 0 else 0
-                print(f"    layer {layer_idx}: {unfilled_area:.1f} mm^2 unfilled ({pct_layer:.0f}% of {total_area:.0f} mm^2 bridge)")
+            print("  Layers with truly-unsupported area > 0.5 mm^2 (worst first):")
+            for layer_idx, total_area, unsup_area in offenders:
+                pct_layer = (unsup_area / total_area * 100) if total_area > 0 else 0
+                print(f"    layer {layer_idx}: {unsup_area:.1f} mm^2 unsupported ({pct_layer:.0f}% of {total_area:.0f} mm^2 bridge)")
 
     if gcodeWasModified:
         overwrite = True
@@ -2029,6 +2093,62 @@ def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, kwargs={}) -> lis
             GCodeLines.append(p2GCode(pExtendEnd, E=extDist * eSteps))
 
     return GCodeLines
+
+def preservedBridgeGCode(kept, parameters: dict) -> list:
+    """Emit gcode that re-prints original bridge segments in regions the BFS could not fill.
+
+    `kept` is a (Multi)LineString = (original bridge LineString) ∩ (unfilled region).
+    Output matches arc2GCode's flat-list-of-strings shape so it can be appended
+    to arcOverhangGCode and emitted alongside the arcs.
+    """
+    output: list = []
+    if kept is None or kept.is_empty:
+        return output
+
+    if hasattr(kept, "geoms"):
+        line_list = [g for g in kept.geoms if g.geom_type == "LineString"]
+    elif kept.geom_type == "LineString":
+        line_list = [kept]
+    else:
+        return output  # GeometryCollection with no usable lines
+
+    # Bridge extrusion: cross-sectional area of nozzle / filament cross-section.
+    # bridge_flow defaults to 1.0 in Bambu/Orca; we don't track it as a setting.
+    nozzle_d = float(parameters.get("nozzle_diameter", 0.4))
+    filament_d = float(parameters.get("filament_diameter", 1.75))
+    e_per_mm = (nozzle_d / filament_d) ** 2
+
+    bridge_speed_mm_s = float(parameters.get("bridge_speed", 5) or 5)
+    bridge_F = max(60, int(bridge_speed_mm_s * 60))
+    travel_F = int(parameters.get("ArcTravelFeedRate", 1800))
+
+    output.append("; PRESERVED BRIDGE (BFS gap fill)\n")
+    output.append(retractGCode(retract=False, kwargs=parameters))
+    feedrate_set = False
+    for ls in line_list:
+        if ls.is_empty or ls.length < 0.05:
+            continue
+        coords = list(ls.coords)
+        if len(coords) < 2:
+            continue
+        # Travel to start of this kept segment.
+        x0, y0 = coords[0]
+        output.append(f"G1 X{x0:.4f} Y{y0:.4f} F{travel_F}\n")
+        feedrate_set = False
+        prev_x, prev_y = x0, y0
+        for x, y in coords[1:]:
+            seg_len = ((x - prev_x) ** 2 + (y - prev_y) ** 2) ** 0.5
+            if seg_len < 1e-3:
+                continue
+            e = e_per_mm * seg_len
+            if not feedrate_set:
+                output.append(f"G1 X{x:.4f} Y{y:.4f} E{e:.5f} F{bridge_F}\n")
+                feedrate_set = True
+            else:
+                output.append(f"G1 X{x:.4f} Y{y:.4f} E{e:.5f}\n")
+            prev_x, prev_y = x, y
+    return output
+
 
 def hilbert2GCode(allhilbertpts: list, parameters: dict, layerheight: float):
     """Generates G-code for a 3D printer based on a list of Hilbert curve points."""

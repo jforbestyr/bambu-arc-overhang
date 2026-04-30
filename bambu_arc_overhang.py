@@ -223,6 +223,7 @@ def process_one_plate(
             if line.startswith("Coverage:")
             or line.startswith("  Layers with")
             or line.startswith("    layer ")
+            or "rejecting poly" in line
         ]
 
         modified = shim_out.exists() and shim_out.stat().st_size > 0
