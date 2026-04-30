@@ -137,7 +137,11 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "MinArea": 0,  # Minimum overhang area to generate arcs. Unit: mm²
         "MinBridgeLength": 0,  # Minimum bridge length to generate arcs. Unit: mm
         "MinDistanceFromPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Control how much bumpiness you allow between arcs and perimeter. Lower will follow perimeter better, but create a lot of very small arcs. Should be more than 1 Arc width! Unit: mm
+        "MinFillRatioToReplace": 0.0, # If >0 and the BFS fills less than this fraction of a bridge's area, the bridge is rejected (its gcode is kept, no arcs injected). Prevents leaving thin sections without support when arcs can't reach them.
         "MinStartArcs": 2,  # How many arcs shall be generated in the first step
+        "OnlyBridgesSupportingTopSurfaces": False, # If true, only convert bridges that are below a stack of internal solid infill capped by a top surface (within BridgeSupportLookAheadZ above).
+        "BridgeSupportLookAheadZ": 4.0, # mm above the bridge to scan for the supporting solid stack and top surface.
+        "MinTopSurfaceCoverageRatio": 0.5, # Fraction (0..1) of the bridge's area that must be directly under solid material (Top surface OR Internal solid infill) in the very next layer for it to qualify. Filters out "internal web" bridges that span over voids/sparse infill. 0 disables the check.
         "Path2Output": r"",  # Leave empty to overwrite the file or write to a new file. Full path required.
         "RMax": 30,  # The max radius of the arcs.
         "ReplaceInternalBridging": True, # If true, will replace bridging that goes over external perimeters but does not have overhang perimeters nearby.
@@ -275,7 +279,9 @@ _EQUIVALENT_NAMES = {
         ";TYPE:Bridge infill": ";TYPE:Bridge",
         ";TYPE:External perimeter": ";TYPE:Outer wall",
         ";TYPE:Overhang perimeter": ";TYPE:Overhang wall",
+        ";TYPE:Perimeter": ";TYPE:Inner wall",
         ";TYPE:Solid infill": ";TYPE:Internal solid infill",
+        ";TYPE:Top solid infill": ";TYPE:Top surface",
         ";WIPE_START": ";WIPE_START",
         ";WIPE_END": ";WIPE_END",
     },
@@ -285,6 +291,69 @@ def getSlicerSpecificName(name: str):
     if slicer == "PrusaSlicer":  # No need to map in this case, but the mapping above is left to help contributors translate their own slicer.
         return name
     return _EQUIVALENT_NAMES.get(slicer).get(name, name)
+
+def _ensureChainPolys(layer) -> None:
+    """Lazily compute Top-surface and Internal-solid-infill polys for a layer."""
+    if getattr(layer, "_chainPolysReady", False):
+        return
+    if not layer.features:
+        layer.extract_features()
+    extend = layer.parameters.get("ExtendArcsIntoPerimeter", 1)
+    layer.allSolidInfillPolys = layer.computeFeaturePolys(getSlicerSpecificName(";TYPE:Solid infill"), extend=extend)
+    layer.topSurfacePolys = layer.computeFeaturePolys(getSlicerSpecificName(";TYPE:Top solid infill"), extend=extend)
+    layer._chainPolysReady = True
+
+
+def nextLayerSolidCoverageRatio(bridgePoly, layerobjs, currentIdx) -> float:
+    """
+    Fraction of bridgePoly's area that overlaps Top-surface or Internal-solid-infill
+    polygons in the immediately next layer. Returns 0.0 if there is no next layer
+    or the bridge has no area.
+    """
+    if currentIdx + 1 >= len(layerobjs):
+        return 0.0
+    if bridgePoly.area <= 0:
+        return 0.0
+    nextLayer = layerobjs[currentIdx + 1]
+    _ensureChainPolys(nextLayer)
+    solidPolys = nextLayer.allSolidInfillPolys + nextLayer.topSurfacePolys
+    if not solidPolys:
+        return 0.0
+    solidUnion = unary_union(solidPolys)
+    if solidUnion.is_empty:
+        return 0.0
+    overlap = bridgePoly.intersection(solidUnion)
+    return overlap.area / bridgePoly.area
+
+
+def bridgeSupportsTopSurface(bridgePoly, layerobjs, currentIdx, maxZAbove) -> bool:
+    """
+    Walk upward from layerobjs[currentIdx]:
+      - Each layer above must contain Internal solid infill OR Top surface polys that
+        intersect the bridge poly's XY footprint (the chain must stay solid).
+      - As soon as a Top surface poly intersects the bridge, the bridge qualifies.
+      - If the chain breaks (a layer within the lookahead has neither solid nor top
+        intersecting the bridge), the bridge is rejected.
+    Polys for each visited layer are computed lazily and cached.
+    """
+    bridgeZ = layerobjs[currentIdx].z
+    for offset in range(1, len(layerobjs) - currentIdx):
+        layer = layerobjs[currentIdx + offset]
+        if layer.z - bridgeZ > maxZAbove:
+            return False
+        _ensureChainPolys(layer)
+        for tp in layer.topSurfacePolys:
+            if intersects(tp, bridgePoly):
+                return True
+        chainContinues = False
+        for sp in layer.allSolidInfillPolys:
+            if intersects(sp, bridgePoly):
+                chainContinues = True
+                break
+        if not chainContinues:
+            return False
+    return False
+
 
 ################################# MAIN FUNCTION #################################
 #################################################################################
@@ -305,6 +374,10 @@ def main(gCodeFileStream, path2GCode) -> None:
     gcodeWasModified = False
     numOverhangs = 0
     lastfansetting = 0
+    # Coverage diagnostics: track total bridge area we converted vs how much of it
+    # the BFS actually filled with arcs. The leftover is "unsupported" — bridge gcode
+    # got deleted but no arcs replaced it there, so the layer above has nothing to sit on.
+    coverageStats = {"totalBridgeArea": 0.0, "totalUnfilledArea": 0.0, "perLayer": []}
     
     layers = splitGCodeIntoLayers(gcode=gCodeLines)
     gCodeFileStream.close()
@@ -316,7 +389,11 @@ def main(gCodeFileStream, path2GCode) -> None:
         layer.addHeight()
         lastfansetting = layer.spotFanSetting(lastfansetting)
         layerobjs.append(layer)
-    
+
+    # Top-surface chain-check polys are computed lazily inside bridgeSupportsTopSurface()
+    # only for layers actually visited during the chain walk — large models with sparse
+    # bridges skip most layers, which is faster than a full pre-pass.
+
     for idl, layer in enumerate(layerobjs):
         modify = False
         if idl < 2:
@@ -330,6 +407,21 @@ def main(gCodeFileStream, path2GCode) -> None:
             if parameters.get("ReplaceInternalBridging", False):
                 layer.indexOverhangPerimeters()
             layer.verifyinfillpolys(prevLayer=prevLayer, maxDistForValidation=2 * parameters.get("perimeter_extrusion_width"))
+
+            if parameters.get("OnlyBridgesSupportingTopSurfaces") and layer.validpolys:
+                lookAhead = parameters.get("BridgeSupportLookAheadZ", 4.0)
+                minCoverage = parameters.get("MinTopSurfaceCoverageRatio", 0.0)
+                kept = []
+                for poly in layer.validpolys:
+                    if not bridgeSupportsTopSurface(poly, layerobjs, idl, lookAhead):
+                        continue
+                    if minCoverage > 0:
+                        ratio = nextLayerSolidCoverageRatio(poly, layerobjs, idl)
+                        if ratio < minCoverage:
+                            print(f"layer {idl}: skipping bridge poly (next-layer solid coverage {ratio*100:.0f}% < {minCoverage*100:.0f}%)")
+                            continue
+                    kept.append(poly)
+                layer.validpolys = kept
 
             # ARC GENERATION
             if layer.validpolys:
@@ -366,6 +458,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                     if startLineString is None:
                         warnings.warn("Skipping Polygon because no StartLine Found")
                         layer.failedArcGenPolys.append(poly)
+                        coverageStats["totalBridgeArea"] += poly.area
+                        coverageStats["totalUnfilledArea"] += poly.area
+                        coverageStats["perLayer"].append((idl, poly.area, poly.area))
                         continue
                     prepare(boundaryWithOutStartLine)
                     startpt = getStartPtOnLS(startLineString, parameters)
@@ -393,6 +488,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                             if len(concentricArcs) < parameters.get("MinStartArcs"):
                                 warnings.warn("Initialization Error: no concentric Arc could be generated at startpoints, moving on")
                                 layer.failedArcGenPolys.append(poly)
+                                coverageStats["totalBridgeArea"] += poly.area
+                                coverageStats["totalUnfilledArea"] += poly.area
+                                coverageStats["perLayer"].append((idl, poly.area, poly.area))
                                 continue
                     destroy_prepared(boundaryWithOutStartLine)
                     arcBoundaries = getArcBoundaries(concentricArcs)
@@ -410,7 +508,21 @@ def main(gCodeFileStream, path2GCode) -> None:
                         plt.show()
                     arcs4gcode.extend(arcBoundaries)
 
-                    # Poly finished
+                    # Poly finished — record coverage diagnostics
+                    unfilledArea = max(0.0, poly.area - finalFilledSpace.area)
+                    fillRatio = (finalFilledSpace.area / poly.area) if poly.area > 0 else 1.0
+                    minFillRatio = parameters.get("MinFillRatioToReplace", 0.0)
+                    if minFillRatio > 0 and fillRatio < minFillRatio:
+                        # Reject this poly: keep its bridge gcode, drop the generated arcs.
+                        # failedArcGenPolys is checked in prepareDeletion to skip deletion,
+                        # so this bridge stays intact (supported as bridge, just no arcs).
+                        print(f"layer {idl}: rejecting poly (fill ratio {fillRatio*100:.0f}% < {minFillRatio*100:.0f}% threshold) — bridge gcode preserved")
+                        layer.failedArcGenPolys.append(poly)
+                        arcs4gcode = []  # discard generated arcs for this poly
+                        continue
+                    coverageStats["totalBridgeArea"] += poly.area
+                    coverageStats["totalUnfilledArea"] += unfilledArea
+                    coverageStats["perLayer"].append((idl, poly.area, unfilledArea))
                     remain2FillPercent = (1 - finalFilledSpace.area / poly.area) * 100
                     if remain2FillPercent > 100 - parameters.get("WarnBelowThisFillingPercentage"):
                         # layer.failedArcGenPolys.append(poly) # Percentage detection not reliable TODO
@@ -532,6 +644,24 @@ def main(gCodeFileStream, path2GCode) -> None:
                 modifiedlayer.indexedOverhangPerimeters = layer.indexedOverhangPerimeters
                 layerobjs[idl] = modifiedlayer  # Overwrite the infos
     
+    # Coverage diagnostic: how much of the bridge area we converted now lacks any
+    # arc support (bridge gcode deleted but BFS couldn't fill it).
+    if coverageStats["totalBridgeArea"] > 0:
+        bridge = coverageStats["totalBridgeArea"]
+        unfilled = coverageStats["totalUnfilledArea"]
+        pct = (unfilled / bridge) * 100 if bridge > 0 else 0
+        print(f"Coverage: {bridge:.0f} mm^2 of bridges converted, {unfilled:.0f} mm^2 unsupported ({pct:.1f}%)")
+        offenders = sorted(
+            (e for e in coverageStats["perLayer"] if e[2] > 0.5),
+            key=lambda e: e[2],
+            reverse=True,
+        )[:10]
+        if offenders:
+            print("  Layers with unfilled area > 0.5 mm^2 (worst first):")
+            for layer_idx, total_area, unfilled_area in offenders:
+                pct_layer = (unfilled_area / total_area * 100) if total_area > 0 else 0
+                print(f"    layer {layer_idx}: {unfilled_area:.1f} mm^2 unfilled ({pct_layer:.0f}% of {total_area:.0f} mm^2 bridge)")
+
     if gcodeWasModified:
         overwrite = True
         if parameters.get("Path2Output"):
@@ -693,6 +823,9 @@ class Layer():
         self.deletelines=set()
         self.associatedIDs=[]
         self.sinfills=[]
+        self.allSolidInfillPolys=[]
+        self.topSurfacePolys=[]
+        self.innerPerimeterPolys: List[Polygon]=[]
         self.parameters=kwargs
         self.lastP=None
 
@@ -716,6 +849,7 @@ class Layer():
 
     def extract_features(self) -> None:
         """Extract features (e.g., perimeter, infill) from G-code lines."""
+        self.features = []
         buff = []
         currenttype = ""
         start = 0
@@ -814,40 +948,79 @@ class Layer():
             except ValueError:
                 print("Polygon does not exist.")
 
+    def makeInnerPerimeterPolys(self) -> None:
+        """Create one polygon per inner-wall ring (each ring is a continuous extrusion segment)."""
+        innerName = getSlicerSpecificName(";TYPE:Perimeter")
+        for fe in self.features:
+            ftype = fe[0]
+            lines = fe[1]
+            if innerName not in ftype:
+                continue
+            pts = []
+            wiping = False
+            for line in lines:
+                if isTravelMove(line):
+                    if len(pts) > 2:
+                        ring = Polygon(pts)
+                        if ring.is_valid:
+                            self.innerPerimeterPolys.append(ring)
+                    pts = []
+                    continue
+                if getSlicerSpecificName(";WIPE_END") in line:
+                    wiping = False
+                    continue
+                if wiping:
+                    continue
+                if getSlicerSpecificName(";WIPE_START") in line:
+                    wiping = True
+                    continue
+                if "G1 X" in line:
+                    p = getPtfromCmd(line)
+                    if p:
+                        pts.append(p)
+            if len(pts) > 2:
+                ring = Polygon(pts)
+                if ring.is_valid:
+                    self.innerPerimeterPolys.append(ring)
+        for ring in self.innerPerimeterPolys:
+            prepare(ring)
+
     def makeStartLineString(self, poly: Polygon, kwargs: dict = {}):
-        """Create a starting LineString for arc generation by intersecting with previous layer's external perimeter."""
+        """Create a starting LineString for arc generation by intersecting with previous layer's perimeters."""
         if not self.extPerimeterPolys:
             self.makeExternalPerimeter2Polys()  # Generate external perimeter polygons if not available
 
-        if len(self.extPerimeterPolys) < 1:
+        # Search candidates: outer perimeters first, then inner-wall rings as fallback for
+        # internal bridges that don't touch the model's outer outline.
+        candidates = list(self.extPerimeterPolys)
+        useInnerFallback = bool(kwargs.get("OnlyBridgesSupportingTopSurfaces") or kwargs.get("UseInnerPerimetersForStartLine"))
+        if useInnerFallback:
+            if not self.innerPerimeterPolys:
+                self.makeInnerPerimeterPolys()
+            candidates.extend(self.innerPerimeterPolys)
+
+        if len(candidates) < 1:
             warnings.warn(f"Layer {self.layernumber}: No ExternalPerimeterPolys found in prev Layer")
             return None, None
-        
-        for ep in self.extPerimeterPolys:
+
+        for ep in candidates:
             ep = buffer(ep, 1e-2)  # Avoid self-intersection errors
             if intersects(ep, poly):
                 startArea = ep.intersection(poly)  # Find the intersection area
                 startLineString = startArea.boundary.intersection(buffer(poly.boundary, 1e-2))  # Get the boundary intersection
-                
+
                 if startLineString.is_empty:
                     if poly.contains(startArea):  # If inside, no boundaries can overlap
                         startLineString = startArea.boundary
                         boundaryLineString = poly.boundary
-                        
+
                         if startLineString.is_empty:  # Still empty? Unlikely to happen
-                            # plt.title("StartLineString is None")
-                            # plot_geometry(poly, 'b')
-                            # plot_geometry(startArea, filled=True)
-                            # plot_geometry([ep for ep in self.extPerimeterPolys])
-                            # plt.legend(["currentLayerPoly", "StartArea", "prevLayerPoly"])
-                            # plt.axis('square')
-                            # plt.show()
                             warnings.warn(f"Layer {self.layernumber}: No Intersection in Boundary, Poly + ExternalPoly")
                             return None, None
-                
+
                 else:
                     boundaryLineString = poly.boundary.difference(buffer(startArea.boundary, 1e-2))  # Get the remaining boundary
-                
+
                 if kwargs.get("plotStart"):
                     print("Geom-Type:", poly.geom_type)
                     plot_geometry(poly, color="b")
@@ -857,16 +1030,9 @@ class Layer():
                     plt.legend(["Poly4ArcOverhang", "External Perimeter prev Layer", "StartLine for Arc Generation"])
                     plt.axis('square')
                     plt.show()
-                
+
                 return startLineString, boundaryLineString
-        
-        # End of for loop, and no intersection found
-        # plt.title("no intersection with prev Layer Boundary")
-        # plot_geometry(poly, 'b')
-        # plot_geometry([ep for ep in self.extPerimeterPolys])
-        # plt.legend(["currentLayerPoly", "prevLayerPoly"])
-        # plt.axis('square')
-        # plt.show()
+
         warnings.warn(f"Layer {self.layernumber}: No intersection with prevLayer External Perimeter detected")
         return None, None
 
@@ -971,6 +1137,15 @@ class Layer():
 
         return parts, partLocations
 
+    def computeFeaturePolys(self, featureName: str, extend: float = 1) -> list:
+        """Return buffered polygons for every gcode path under the named feature."""
+        parts = self.spotFeaturePoints(featureName, splitAtTravel=True, includeRealStartPt=True)[0]
+        polys = []
+        for pts in parts:
+            if len(pts) >= 2:
+                polys.append(buffer(LineString(pts), extend + 5e-2))
+        return polys
+
     def spotSolidInfill(self) -> None:
         """Identify and store solid infill features from G-code."""
         for part, location in zip(*self.spotFeaturePoints(getSlicerSpecificName(";TYPE:Solid infill"), splitAtTravel=True, includeRealStartPt=True)):
@@ -1035,7 +1210,7 @@ class Layer():
     def verifyinfillpolys(self, prevLayer, maxDistForValidation: float = 0.5) -> None:
         """Verify infill polygons by checking their proximity to overhangs and other criteria."""
         overhangs = self.indexedOverhangPerimeters  # Get overhang perimeters
-        if len(overhangs.geometries) > 0 or self.parameters.get("ReplaceInternalBridging"):
+        if len(overhangs.geometries) > 0 or self.parameters.get("ReplaceInternalBridging") or self.parameters.get("OnlyBridgesSupportingTopSurfaces"):
             if self.parameters.get("PrintDebugVerification"):
                 print(f"Layer {self.layernumber}: {len(overhangs.geometries)} Overhangs found")
             
@@ -1071,19 +1246,26 @@ class Layer():
                 dists = overhangs.query_nearest(poly, maxDistForValidation, return_distance=True)[1]
                 extOverlappers = indexedExtPerimeters.query(poly)
                 overIntersectors = prevIndexedOverhangPerimeters.query(poly)
-                for dist in dists:
-                    if dist < maxDistForValidation:  # Check if this poly is close to an overhang
-                        verified = True
-                        break
-                if not verified and self.parameters.get("ReplaceInternalBridging"):
-                    for intersectId in extOverlappers:
-                        if intersects(indexedExtPerimeters.geometries[intersectId], poly) and not covered_by(indexedExtPerimeters.geometries[intersectId], poly):  # Check if this poly hangs over an edge
+                if self.parameters.get("OnlyBridgesSupportingTopSurfaces"):
+                    # The top-surface chain check (run after this method) is the real gate.
+                    # Auto-verify here so internal bridges that don't touch any outer perimeter
+                    # (e.g. those fully inside the model interior) still reach arc generation,
+                    # where makeStartLineString can fall back to inner-wall perimeters.
+                    verified = True
+                else:
+                    for dist in dists:
+                        if dist < maxDistForValidation:  # Check if this poly is close to an overhang
                             verified = True
                             break
-                    for intersectId in overIntersectors:
-                        if intersects(poly, prevIndexedOverhangPerimeters.geometries[intersectId]) and not covered_by(prevIndexedOverhangPerimeters.geometries[intersectId], poly):  # Check if this poly hangs over an overhang
-                            verified = True
-                            break
+                    if not verified and self.parameters.get("ReplaceInternalBridging"):
+                        for intersectId in extOverlappers:
+                            if intersects(indexedExtPerimeters.geometries[intersectId], poly) and not covered_by(indexedExtPerimeters.geometries[intersectId], poly):  # Check if this poly hangs over an edge
+                                verified = True
+                                break
+                        for intersectId in overIntersectors:
+                            if intersects(poly, prevIndexedOverhangPerimeters.geometries[intersectId]) and not covered_by(prevIndexedOverhangPerimeters.geometries[intersectId], poly):  # Check if this poly hangs over an overhang
+                                verified = True
+                                break
                 if verified:
                     self.validpolys.append(poly)  # Mark polygon as valid
                     self.deleteTheseInfills.append(idp)  # Mark for deletion
@@ -1425,46 +1607,127 @@ def create_circle_between_angles(center:Point, radius:float, startAngle:float, e
     points = np.column_stack((radius * np.sin(theta) + x, radius * np.cos(theta) + y))  # Compute circle points
     return LineString(points)
 
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+    _HAS_KDTREE = True
+except ImportError:
+    _HAS_KDTREE = False
+
+
+def _densify_polyline(polyline_xy: NDArray, max_spacing: float = 0.1) -> NDArray:
+    """Insert intermediate samples so consecutive points are at most max_spacing apart.
+
+    Vectorized: distributes samples along the cumulative polyline length and maps
+    each sample back to its host segment. No Python-level segment loop.
+    """
+    if len(polyline_xy) < 2:
+        return polyline_xy
+    seg_diffs = np.diff(polyline_xy, axis=0)
+    seg_lens = np.linalg.norm(seg_diffs, axis=1)
+    total_len = float(seg_lens.sum())
+    if total_len <= 0:
+        return polyline_xy
+    if seg_lens.max() <= max_spacing:
+        # Already dense enough — skip densification entirely.
+        return polyline_xy
+    n_total = int(np.ceil(total_len / max_spacing)) + 1
+    sample_t = np.linspace(0.0, total_len, n_total)
+    cum_lens = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    seg_idx = np.searchsorted(cum_lens[1:], sample_t, side='right')
+    np.clip(seg_idx, 0, len(seg_lens) - 1, out=seg_idx)
+    local_t = (sample_t - cum_lens[seg_idx]) / np.maximum(seg_lens[seg_idx], 1e-12)
+    return polyline_xy[seg_idx] + local_t[:, None] * seg_diffs[seg_idx]
+
+
+def _point_to_polyline_distance(points_xy: NDArray, polyline_xy: NDArray) -> NDArray:
+    """
+    Minimum distance from each point in points_xy (N,2) to a polyline defined by
+    consecutive vertices in polyline_xy (M,2). Returns (N,) distances.
+
+    Fast path: cKDTree query against a densified copy of the polyline. The error
+    is bounded by half the densify spacing (default 0.025 mm) — negligible for
+    arc fill decisions which operate at mm scale.
+
+    Slow path (no scipy): segment-loop fallback that updates a running min over
+    all points for each segment.
+    """
+    M = len(polyline_xy)
+    if M < 2:
+        return np.full(len(points_xy), np.inf)
+
+    if _HAS_KDTREE:
+        dense = _densify_polyline(polyline_xy, max_spacing=0.05)
+        tree = _cKDTree(dense)
+        distances, _ = tree.query(points_xy, k=1)
+        return distances
+
+    # Pure-numpy fallback: O(M) Python iterations, O(N) numpy ops per segment.
+    px = points_xy[:, 0]
+    py = points_xy[:, 1]
+    min_dist_sq = np.full(len(points_xy), np.inf)
+    for i in range(M - 1):
+        ax, ay = polyline_xy[i]
+        bx, by = polyline_xy[i + 1]
+        abx = bx - ax
+        aby = by - ay
+        ab_len_sq = max(abx * abx + aby * aby, 1e-12)
+        apx = px - ax
+        apy = py - ay
+        t = (apx * abx + apy * aby) / ab_len_sq
+        np.clip(t, 0.0, 1.0, out=t)
+        dx = apx - t * abx
+        dy = apy - t * aby
+        dist_sq = dx * dx + dy * dy
+        np.minimum(min_dist_sq, dist_sq, out=min_dist_sq)
+    return np.sqrt(min_dist_sq)
+
+
+def _point_to_boundary_distance(points_xy: NDArray, boundary) -> NDArray | None:
+    """Min distance from each point to a polygon boundary (LineString or MultiLineString)."""
+    if boundary.geom_type == "LineString":
+        rings = [get_coordinates(boundary)]
+    elif boundary.geom_type == "MultiLineString":
+        rings = [get_coordinates(ls) for ls in boundary.geoms]
+    else:
+        return None  # Caller falls back to shapely.distance.
+    out = None
+    for ring in rings:
+        if len(ring) < 2:
+            continue
+        d = _point_to_polyline_distance(points_xy, ring)
+        out = d if out is None else np.minimum(out, d)
+    return out
+
+
 def get_farthest_points(from_geom: Geometry, to_poly: Polygon, number_of_points: int = 1) -> Tuple[NDArray, NDArray, NDArray]:
     """
     Find the point on a given geometry that is farthest away from the boundary of a polygon.
-    
-    Parameters
-    ----------
-    from_geom : Geometry
-        The geometry (e.g., LineString, MultiLineString) from which to find the farthest point.
-    to_poly : Polygon
-        The polygon representing the boundary.
-    
-    Returns
-    -------
-    farthest_point : Point or None
-        The point on the geometry that is farthest from the polygon's boundary.
-    longest_distance : float or None
-        The distance from the farthest point to the polygon's boundary.
     """
     if from_geom.is_empty:
-        return None, None  # Return None if the input geometry is empty
+        return None, None
 
-    coords = points(get_coordinates(from_geom))  # Extract points from the geometry's coordinates
+    coords_xy = get_coordinates(from_geom)              # (N, 2) numpy
+    coords = points(coords_xy)                          # Point objects (kept for caller compat)
 
-    distances = distance(to_poly.boundary, coords)  # Calculate distances from each point to the polygon's boundary
-    farthest_points = []
-    longest_distances = []
-    # Get the top indices sorted by descending distances
+    distances = _point_to_boundary_distance(coords_xy, to_poly.boundary)
+    if distances is None:
+        # Unusual boundary type — fall back to shapely's per-point distance.
+        distances = distance(to_poly.boundary, coords)
+
     top_indices = np.argsort(distances, kind='heapsort')[:-(number_of_points + 1):-1]
-
-    # Retrieve the longest distances and farthest points
     longest_distances = distances[top_indices]
     farthest_points = coords[top_indices]
 
     bisector_vectors = []
+    n = len(coords_xy)
     for id in top_indices:
-        p0, p1, p2 = coords[id], coords[id-1], coords[(id+1)%len(coords)]
-        v_a = np.array([p1.x - p0.x, p1.y - p0.y])
-        v_b = np.array([p2.x - p0.x, p2.y - p0.y])
+        p0 = coords_xy[id]
+        p1 = coords_xy[id - 1]
+        p2 = coords_xy[(id + 1) % n]
+        v_a = p1 - p0
+        v_b = p2 - p0
         bisector_vectors.append(get_angle_bisector(v_a, v_b))
-    
+
     return farthest_points, longest_distances, bisector_vectors
 
 def get_angle_bisector(vec_a, vec_b):
