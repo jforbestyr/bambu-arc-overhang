@@ -137,6 +137,7 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "MinArea": 0,  # Minimum overhang area to generate arcs. Unit: mm²
         "MinBridgeLength": 0,  # Minimum bridge length to generate arcs. Unit: mm
         "MinDistanceFromPerimeter": 1 * gCodeSettingDict.get("extrusion_width"),  # Control how much bumpiness you allow between arcs and perimeter. Lower will follow perimeter better, but create a lot of very small arcs. Should be more than 1 Arc width! Unit: mm
+        "BridgePolyClosingRadius": 1.0, # mm. Closing operation radius applied to each bridge polygon. Merges adjacent buffered gcode lines so the BFS sees the bridge's full surface (independent of the slicer's chosen infill direction/spacing). 0 to disable.
         "MinFillRatioToReplace": 0.0, # If >0 and the BFS fills less than this fraction of a bridge's area, the bridge is rejected (its gcode is kept, no arcs injected). Prevents leaving thin sections without support when arcs can't reach them.
         "MinStartArcs": 2,  # How many arcs shall be generated in the first step
         "OnlyBridgesSupportingTopSurfaces": False, # If true, only convert bridges that are below a stack of internal solid infill capped by a top surface (within BridgeSupportLookAheadZ above).
@@ -1185,17 +1186,29 @@ class Layer():
             self.binfills.append(BridgeInfill(infillpts))  # Create and store BridgeInfill objects
 
     def makePolysFromBridgeInfill(self, extend: float = 1) -> None:
-        """Create polygons from bridge infill LineStrings by buffering them."""
+        """Create polygons from bridge infill paths.
+
+        Each bridge feature is a continuous gcode path — usually a zig-zag of
+        parallel extrusion lines covering an area. Buffering the LineString by
+        the extrusion radius alone leaves gaps perpendicular to the lines when
+        the slicer's bridge spacing is larger than 2*extend. The closing
+        operation (dilate then erode by `BridgePolyClosingRadius`) merges
+        adjacent line buffers into one solid polygon covering the bridge's
+        actual surface, regardless of the slicer-chosen infill direction.
+        """
+        closing_radius = float(self.parameters.get("BridgePolyClosingRadius", 0.0) or 0.0)
         for bInfill in self.binfills:
-            infillPts = bInfill.pts  # Get infill points
-            infillLS = LineString(infillPts)  # Create LineString from points
-            infillPoly = buffer(infillLS, extend + 5e-2)  # Buffer the LineString to create a polygon
-            self.polys.append(infillPoly)  # Add the polygon to the list
-            self.associatedIDs.append(bInfill.id)  # Store the associated ID
+            infillPts = bInfill.pts
+            infillLS = LineString(infillPts)
+            infillPoly = buffer(infillLS, extend + 5e-2)
+            if closing_radius > 0 and not infillPoly.is_empty:
+                infillPoly = buffer(buffer(infillPoly, closing_radius), -closing_radius)
+            self.polys.append(infillPoly)
+            self.associatedIDs.append(bInfill.id)
 
             if self.parameters.get("plotDetectedInfillPoly"):
-                plot_geometry(infillPoly)  # Plot the polygon
-                plot_geometry(infillLS, "g")  # Plot the LineString in green
+                plot_geometry(infillPoly)
+                plot_geometry(infillLS, "g")
                 plt.axis('square')
                 plt.show()
 

@@ -112,6 +112,7 @@ def _patched_make(gCodeSettingDict):
     full["ArcMinPrintSpeed"] = {arc_min_print_speed_mm_min}
     full["MinTopSurfaceCoverageRatio"] = {min_top_coverage}
     full["MinFillRatioToReplace"] = {min_fill_ratio}
+    full["BridgePolyClosingRadius"] = {bridge_closing_mm}
     {arc_center_offset_line}
     full["specialCoolingZdist"] = {special_cooling_zdist_mm}
     full["doSpecialCooling"] = {do_special_cooling}
@@ -133,6 +134,7 @@ class Settings:
         arc_min_speed_mm_s: float,
         min_top_coverage: float,
         min_fill_ratio: float,
+        bridge_closing_mm: float,
         arc_center_offset_mm,  # float | None
         above_arcs_zdist_mm: float,
         hilbert_cooling: bool,
@@ -142,6 +144,7 @@ class Settings:
         self.arc_min_speed_mm_s = arc_min_speed_mm_s
         self.min_top_coverage = min_top_coverage
         self.min_fill_ratio = min_fill_ratio
+        self.bridge_closing_mm = bridge_closing_mm
         self.arc_center_offset_mm = arc_center_offset_mm
         self.above_arcs_zdist_mm = above_arcs_zdist_mm
         self.hilbert_cooling = hilbert_cooling
@@ -169,6 +172,7 @@ def run_post_processor(in_path: Path, out_path: Path, settings: Settings) -> Non
         arc_min_print_speed_mm_min=settings.arc_min_speed_mm_s * 60,
         min_top_coverage=settings.min_top_coverage,
         min_fill_ratio=settings.min_fill_ratio,
+        bridge_closing_mm=settings.bridge_closing_mm,
         arc_center_offset_line=arc_center_offset_line,
         special_cooling_zdist_mm=settings.above_arcs_zdist_mm,
         do_special_cooling=repr(bool(settings.hilbert_cooling)),
@@ -329,6 +333,16 @@ def main() -> None:
         "significant unfilled area on a load-bearing layer. Default 0 = always replace.",
     )
     parser.add_argument(
+        "--bridge-closing",
+        type=float,
+        default=1.0,
+        help="Closing-operation radius in mm applied to bridge polygons before arc "
+        "generation. Merges adjacent buffered gcode lines so the BFS sees the bridge's "
+        "full surface independent of the slicer's infill direction (avoids 'comb' "
+        "polygons with gaps between parallel bridge lines). Default 1.0; set to 0 to "
+        "disable.",
+    )
+    parser.add_argument(
         "--above-arcs-zdist",
         type=float,
         default=0.0,
@@ -367,6 +381,7 @@ def main() -> None:
         arc_min_speed_mm_s=args.arc_min_speed,
         min_top_coverage=args.min_top_coverage,
         min_fill_ratio=args.min_fill_ratio,
+        bridge_closing_mm=args.bridge_closing,
         arc_center_offset_mm=args.arc_center_offset,
         above_arcs_zdist_mm=args.above_arcs_zdist,
         hilbert_cooling=args.enable_hilbert_cooling,

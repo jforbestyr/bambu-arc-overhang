@@ -7,6 +7,7 @@ This repo is a Bambu-focused fork of [Wasupmacuz/arc-overhang-prusaslicer-integr
 - A Bambu Studio `.3mf` wrapper ([`bambu_arc_overhang.py`](bambu_arc_overhang.py)) that extracts plate gcode, runs the post-processor, refreshes the md5 sidecar Bambu printers verify, and repacks the archive.
 - A "supports a top surface" filter so only bridges that actually hold up a top solid surface become arcs (no internal-web bridges that span over voids).
 - A coverage filter (`--min-top-coverage`, default 50%) that skips bridges whose immediate next layer is mostly *not* solid above them.
+- A closing operation on bridge polygons (`--bridge-closing`, default 1.0 mm) so the arc BFS sees the bridge's full surface — independent of the slicer's chosen infill direction — instead of a comb of thin parallel polys with gaps.
 - New defaults tuned for fast prints (5 mm/s arcs, no above-arc cooling slowdown, no Hilbert cross-hatch).
 - A coverage diagnostic that surfaces total unsupported surface area per plate so you can see when arcs failed to fill a bridge.
 - Multi-plate `.3mf` support with parallel processing.
@@ -69,6 +70,11 @@ Bridges that don't qualify are left as-is; bridges that qualify get their bridge
                               coverage diagnostic shows unfilled area on a
                               load-bearing layer. Try 0.85 or 0.95. Default
                               0 = always replace.
+--bridge-closing FLOAT        Closing-operation radius (mm) applied to bridge
+                              polygons. Merges adjacent buffered gcode lines
+                              so the BFS sees the bridge's full surface
+                              regardless of the slicer's infill direction.
+                              Default 1.0 mm. Set 0 to disable.
 --above-arcs-zdist FLOAT      Re-enable above-arc cooling pass within this
                               vertical distance (mm). Default 0 = OFF.
 --enable-hilbert-cooling      Restore the Hilbert-curve cross-hatch fill above
