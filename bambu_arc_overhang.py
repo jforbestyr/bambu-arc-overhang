@@ -54,6 +54,15 @@ ORCA_TO_BAMBU = [(b, a) for a, b in BAMBU_TO_ORCA]
 FEATURE_RE = re.compile(r"^; FEATURE: (.+)$")
 TYPE_RE = re.compile(r"^;TYPE:(.+)$")
 
+# Type names the post-processor invents that Bambu Studio's gcode preview
+# does not recognize. These get renamed to a known Bambu feature on the way
+# back out so the preview parser categorizes them correctly. Without this,
+# Bambu Studio wipes the plate when you select it (unrecognized FEATURE name
+# breaks its preview rendering).
+TYPE_NAME_REWRITES = {
+    "Arc infill": "Bridge",
+}
+
 
 def bambu_to_orca(text: str) -> str:
     out_lines = []
@@ -89,7 +98,8 @@ def orca_to_bambu(text: str) -> str:
             continue
         m = TYPE_RE.match(stripped)
         if m:
-            out_lines.append(f"; FEATURE: {m.group(1)}{eol}")
+            name = TYPE_NAME_REWRITES.get(m.group(1), m.group(1))
+            out_lines.append(f"; FEATURE: {name}{eol}")
             continue
         replaced = stripped
         for src, dst in ORCA_TO_BAMBU:
