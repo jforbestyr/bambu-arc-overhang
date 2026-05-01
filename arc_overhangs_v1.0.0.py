@@ -124,6 +124,10 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "ArcSlowDownBelowThisDuration": 3,  # Arc Time below this Duration => slow down, Unit: sec
         "ArcPointsPerMillimeter": 10,  # Higher will slow down the code but give better support for following arcs. Recommended values: >=10 when "UseLeastAmountOfCenterPoints": False; else, value can be as low as 1.
         "ArcTravelFeedRate": 30 * 60,  # Slower travel speed, Unit: mm/min
+        "ZHopOnArcTravel": True,  # Master toggle for z-hop on retracted travels in injected arc/preserved-bridge gcode.
+        "ZHopHeight": None,  # mm. None => use the slicer-extracted z_hop. 0 disables.
+        "ZHopFeedRate": 12000,  # mm/min, Bambu's typical Auto-Lift speed.
+        "RetractionMinTravel": None,  # mm. None => use slicer-extracted retraction_minimum_travel. 0 disables the threshold (always retract).
         "ArcWidth": gCodeSettingDict.get("nozzle_diameter") * 0.95,  # Change the spacing between the arcs, should be nozzle_diameter
         "CornerImportanceMultiplier": 0.2,  # Startpoint for Arc generation is chosen close to the middle of the StartLineString and at a corner. Higher => Corner selection more important.
         "DistanceBetweenPointsOnStartLine": 0.1,  # Used for redistribution, if start fails.
@@ -231,6 +235,9 @@ _SLICER_SETTINGS_MAP = {
         'perimeter_extrusion_width': 'perimeter_extrusion_width',
         "retract_length": "retract_length",
         'retract_speed': 'retract_speed',
+        "deretract_speed": "deretract_speed",
+        "retract_lift": "z_hop",
+        "retract_before_travel": "retraction_minimum_travel",
         "solid_infill_extrusion_width": "solid_infill_extrusion_width",
         'temperature': 'temperature',
         'travel_speed': 'travel_speed',
@@ -251,6 +258,9 @@ _SLICER_SETTINGS_MAP = {
         'inner_wall_line_width': 'perimeter_extrusion_width',
         "retraction_length": "retract_length",
         'retraction_speed': 'retract_speed',
+        "deretraction_speed": "deretract_speed",
+        "z_hop": "z_hop",
+        "retraction_minimum_travel": "retraction_minimum_travel",
         "internal_solid_infill_line_width": "solid_infill_extrusion_width",
         'nozzle_temperature': 'temperature',
         'travel_speed': 'travel_speed',
@@ -571,7 +581,7 @@ def main(gCodeFileStream, path2GCode) -> None:
                     eSteps = calcESteps(parameters)
                     for ida, arc in enumerate(arcs4gcode):
                         if not arc.is_empty:
-                            arcGCode = arc2GCode(arcline=arc, eSteps=eSteps, arcidx=ida, kwargs=parameters)
+                            arcGCode = arc2GCode(arcline=arc, eSteps=eSteps, arcidx=ida, z_print=layer.z, kwargs=parameters)
                             arcOverhangGCode.append(arcGCode)
                             if parameters.get("TimeLapseEveryNArcs") > 0:
                                 if ida % parameters.get("TimeLapseEveryNArcs"):
@@ -593,7 +603,7 @@ def main(gCodeFileStream, path2GCode) -> None:
                                 kept = bridgeLS.intersection(unfilledRegion)
                                 if kept.is_empty:
                                     continue
-                                bridgeFill = preservedBridgeGCode(kept, parameters)
+                                bridgeFill = preservedBridgeGCode(kept, parameters, z_print=layer.z)
                                 if bridgeFill:
                                     arcOverhangGCode.append(bridgeFill)
 
@@ -653,7 +663,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                             for id in reversed(range(injectionStart)):
                                 if "G1 X" in layer.lines[id]:  # TODO: should find changes to Z instead of ignoring them
                                     modifiedlayer.lines.append(retractGCode(retract=True, kwargs=parameters))  # Retract
+                                    modifiedlayer.lines.extend(zHopGCode(True, layer.z, parameters))  # Lift
                                     modifiedlayer.lines.append(line2TravelMove(layer.lines[id], parameters, ignoreZ=True))  # Travel
+                                    modifiedlayer.lines.extend(zHopGCode(False, layer.z, parameters))  # Drop
                                     modifiedlayer.lines.append(retractGCode(retract=False, kwargs=parameters))  # Extrude
                                     break
                             if parameters.get("UseCustomArcTemp", False):
@@ -671,7 +683,9 @@ def main(gCodeFileStream, path2GCode) -> None:
                             for id in reversed(range(injectionStart)):
                                 if "G1 X" in layer.lines[id]:  # TODO: should find changes to Z instead of ignoring them
                                     modifiedlayer.lines.append(retractGCode(retract=True, kwargs=parameters))  # Retract
+                                    modifiedlayer.lines.extend(zHopGCode(True, layer.z, parameters))  # Lift
                                     modifiedlayer.lines.append(line2TravelMove(layer.lines[id], parameters, ignoreZ=True))  # Travel
+                                    modifiedlayer.lines.extend(zHopGCode(False, layer.z, parameters))  # Drop
                                     modifiedlayer.lines.append(retractGCode(retract=False, kwargs=parameters))  # Extrude
                                     break
                     if "G1 F" in line.split(";", 1)[0]:  # Special block-speed-command
@@ -2047,6 +2061,29 @@ def p2GCode(p: Point, E=0, **kwargs) -> str:
     line += '\n'  # End line with a newline character
     return line
 
+def zHopGCode(lift: bool, z_print, kwargs: dict) -> list:
+    """Emit a single G1 Z line to lift or drop the nozzle by `z_hop`.
+
+    Returns [] when z-hop is disabled, height is zero/missing, or `z_print` is unknown.
+    Used inside the injected arc + preserved-bridge gcode to clear the print on
+    retracted travels (Bambu's Auto-Lift behavior).
+    """
+    if not kwargs.get("ZHopOnArcTravel", True):
+        return []
+    h = kwargs.get("ZHopHeight")
+    if h is None:
+        h = kwargs.get("z_hop", 0) or 0
+    try:
+        h = float(h)
+    except (TypeError, ValueError):
+        h = 0.0
+    if h <= 0 or z_print is None:
+        return []
+    target = float(z_print) + h if lift else float(z_print)
+    f = int(kwargs.get("ZHopFeedRate", 12000))
+    return [f"G1 Z{target:.3f} F{f}\n"]
+
+
 def retractGCode(retract: bool = True, kwargs: dict = {}) -> str:
     """Generate G-code for filament retraction or unretraction."""
     retractDist = kwargs.get("retract_length", 1)  # Get retraction distance
@@ -2057,7 +2094,7 @@ def setFeedRateGCode(F: int) -> str:
     """Generate G-code to set the feed rate (F) for the printer."""
     return f"G1 F{F}\n"
 
-def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, kwargs={}) -> list:
+def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, z_print=None, kwargs={}) -> list:
     """Generate G-code for an arc segment based on its LineString and extrusion steps."""
     GCodeLines = []  # Initialize G-code list
     p1 = None
@@ -2073,12 +2110,14 @@ def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, kwargs={}) -> lis
 
     for idp, p in enumerate(pts):
         if idp == 0:
-            # Retract filament and move to the first point
+            # Retract → lift → travel → drop → prime → deretract (Bambu Auto-Lift order).
             GCodeLines.append(retractGCode(retract=True, kwargs=kwargs))
+            GCodeLines.extend(zHopGCode(True, z_print, kwargs))
             dist=distance(pExtendBegin, p)
             p1 = p
             GCodeLines.append(f";Arc {arcidx if arcidx else ' '} Length:{arcline.length}\n")
             GCodeLines.append(p2GCode(pExtendBegin, F=kwargs.get('ArcTravelFeedRate', 100 * 60)))
+            GCodeLines.extend(zHopGCode(False, z_print, kwargs))
             GCodeLines.append(p2GCode(p, E=dist * eSteps))
             GCodeLines.append(retractGCode(retract=False, kwargs=kwargs))
             GCodeLines.append(setFeedRateGCode(arcPrintSpeed))
@@ -2094,12 +2133,18 @@ def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, kwargs={}) -> lis
 
     return GCodeLines
 
-def preservedBridgeGCode(kept, parameters: dict) -> list:
+def preservedBridgeGCode(kept, parameters: dict, z_print=None) -> list:
     """Emit gcode that re-prints original bridge segments in regions the BFS could not fill.
 
     `kept` is a (Multi)LineString = (original bridge LineString) ∩ (unfilled region).
     Output matches arc2GCode's flat-list-of-strings shape so it can be appended
     to arcOverhangGCode and emitted alongside the arcs.
+
+    Each disconnected segment is wrapped in retract → lift → travel → drop →
+    deretract to prevent ooze stringing across the part. Sub-`retraction_minimum_travel`
+    jogs skip the retract pair to match what the slicer would have done. The
+    block ends with a closing retract+lift so the layer's tool-restore travel
+    can move safely without pulling material.
     """
     output: list = []
     if kept is None or kept.is_empty:
@@ -2122,18 +2167,33 @@ def preservedBridgeGCode(kept, parameters: dict) -> list:
     bridge_F = max(60, int(bridge_speed_mm_s * 60))
     travel_F = int(parameters.get("ArcTravelFeedRate", 1800))
 
+    min_travel = parameters.get("RetractionMinTravel")
+    if min_travel is None:
+        min_travel = float(parameters.get("retraction_minimum_travel", 0) or 0)
+
     output.append("; PRESERVED BRIDGE (BFS gap fill)\n")
-    output.append(retractGCode(retract=False, kwargs=parameters))
-    feedrate_set = False
+    prev_end = None
     for ls in line_list:
         if ls.is_empty or ls.length < 0.05:
             continue
         coords = list(ls.coords)
         if len(coords) < 2:
             continue
-        # Travel to start of this kept segment.
         x0, y0 = coords[0]
+        # Decide whether to retract+hop on the travel into this segment. Sub-min-travel
+        # jogs skip retraction to match what the slicer would have done.
+        do_retract = True
+        if prev_end is not None:
+            gap = ((x0 - prev_end[0]) ** 2 + (y0 - prev_end[1]) ** 2) ** 0.5
+            if gap < max(min_travel, 1e-3):
+                do_retract = False
+        if do_retract:
+            output.append(retractGCode(retract=True, kwargs=parameters))
+            output.extend(zHopGCode(True, z_print, parameters))
         output.append(f"G1 X{x0:.4f} Y{y0:.4f} F{travel_F}\n")
+        if do_retract:
+            output.extend(zHopGCode(False, z_print, parameters))
+            output.append(retractGCode(retract=False, kwargs=parameters))
         feedrate_set = False
         prev_x, prev_y = x0, y0
         for x, y in coords[1:]:
@@ -2147,6 +2207,9 @@ def preservedBridgeGCode(kept, parameters: dict) -> list:
             else:
                 output.append(f"G1 X{x:.4f} Y{y:.4f} E{e:.5f}\n")
             prev_x, prev_y = x, y
+        prev_end = (prev_x, prev_y)
+    # No closing retract here — the layer's tool-restore block (or the next arc's
+    # opening retract) handles ooze prevention on the way out, so we don't double-retract.
     return output
 
 
