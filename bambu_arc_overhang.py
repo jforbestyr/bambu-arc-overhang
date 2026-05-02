@@ -118,8 +118,8 @@ def _patched_make(gCodeSettingDict):
     full = _orig_make(gCodeSettingDict)
     full["OnlyBridgesSupportingTopSurfaces"] = True
     full["ReplaceInternalBridging"] = True
-    full["ArcPrintSpeed"] = {arc_print_speed_mm_min}
-    full["ArcMinPrintSpeed"] = {arc_min_print_speed_mm_min}
+    {arc_print_speed_line}
+    {arc_min_print_speed_line}
     full["MinTopSurfaceCoverageRatio"] = {min_top_coverage}
     full["MinFillRatioToReplace"] = {min_fill_ratio}
     full["BridgePolyClosingRadius"] = {bridge_closing_mm}
@@ -140,8 +140,8 @@ class Settings:
 
     def __init__(
         self,
-        arc_speed_mm_s: float,
-        arc_min_speed_mm_s: float,
+        arc_speed_mm_s,  # float | None
+        arc_min_speed_mm_s,  # float | None
         min_top_coverage: float,
         min_fill_ratio: float,
         bridge_closing_mm: float,
@@ -174,12 +174,20 @@ def run_post_processor(in_path: Path, out_path: Path, settings: Settings) -> Non
         arc_center_offset_line = "pass  # arc-center-offset: use script default"
     else:
         arc_center_offset_line = f'full["ArcCenterOffset"] = {float(settings.arc_center_offset_mm)}'
+    if settings.arc_speed_mm_s is None:
+        arc_print_speed_line = "pass  # arc-speed: inherit from slicer's bridge_speed"
+    else:
+        arc_print_speed_line = f'full["ArcPrintSpeed"] = {float(settings.arc_speed_mm_s) * 60}'
+    if settings.arc_min_speed_mm_s is None:
+        arc_min_print_speed_line = "pass  # arc-min-speed: inherit from arc-speed (= bridge_speed by default)"
+    else:
+        arc_min_print_speed_line = f'full["ArcMinPrintSpeed"] = {float(settings.arc_min_speed_mm_s) * 60}'
     runner_src = RUNNER_TEMPLATE.format(
         post_processor=str(POST_PROCESSOR),
         in_path=str(in_path),
         out_path=str(out_path),
-        arc_print_speed_mm_min=settings.arc_speed_mm_s * 60,
-        arc_min_print_speed_mm_min=settings.arc_min_speed_mm_s * 60,
+        arc_print_speed_line=arc_print_speed_line,
+        arc_min_print_speed_line=arc_min_print_speed_line,
         min_top_coverage=settings.min_top_coverage,
         min_fill_ratio=settings.min_fill_ratio,
         bridge_closing_mm=settings.bridge_closing_mm,
@@ -304,17 +312,19 @@ def main() -> None:
     parser.add_argument(
         "--arc-speed",
         type=float,
-        default=5.0,
-        help="Arc print speed in mm/s. Default 5. Upstream default is 1.5 (very slow). "
-        "Raise for faster prints; lower for stronger bonding on warp-prone material.",
+        default=None,
+        help="Arc print speed in mm/s. If unset, falls back to the slicer's bridge_speed "
+        "so tuning the bridge profile in Bambu Studio directly tunes the arcs (recommended). "
+        "Pass an explicit value to override.",
     )
     parser.add_argument(
         "--arc-min-speed",
         type=float,
-        default=2.0,
-        help="Minimum arc print speed in mm/s for small arcs that the script slows down "
-        "(those that would take less than ArcSlowDownBelowThisDuration=3s at full speed). "
-        "Default 2. Upstream default is 0.5, which produces a long tail of F30 moves.",
+        default=None,
+        help="Minimum arc print speed in mm/s for short arcs that the slowdown logic "
+        "(ArcSlowDownBelowThisDuration=3s) would otherwise drop below. If unset, equals "
+        "--arc-speed (i.e. no slowdown — arcs print at bridge_speed regardless of length). "
+        "Set explicitly to enable per-arc slowdown for tiny radii.",
     )
     parser.add_argument(
         "--min-top-coverage",

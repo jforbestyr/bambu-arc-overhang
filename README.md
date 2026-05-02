@@ -11,7 +11,9 @@ This repo is a Bambu-focused fork of [Wasupmacuz/arc-overhang-prusaslicer-integr
 - A closing operation on bridge polygons (`--bridge-closing`, default 1.0 mm) so the arc BFS sees the bridge's full surface — independent of the slicer's chosen infill direction — instead of a comb of thin parallel polys with gaps.
 - **Preserved bridge gcode in unfilled regions.** Wherever the arc BFS can't reach inside a converted bridge, the script re-emits the original bridge gcode at `bridge_speed` so the layer above is never left without support. This is on by default; removing supporting bridge is never desired.
 - A coverage diagnostic that splits each bridge into arc-filled / preserved-as-bridge / truly-unsupported buckets so problems are easy to spot.
-- Defaults tuned for fast prints (5 mm/s arcs, no above-arc cooling slowdown, no Hilbert cross-hatch).
+- Arcs inherit the slicer's bridge profile by default — `bridge_speed`, `travel_speed`, and `default_acceleration` from the Bambu CONFIG_BLOCK control arc print speed, travel feedrate, and M204 emitted before each arc block. Tune in Bambu Studio; CLI overrides remain available.
+- Fan is always forced to 100% on the arc layer (overrides slicer profile) — arcs need maximum cooling regardless of how the rest of the print is tuned.
+- Other defaults tuned for fast prints (no above-arc cooling slowdown, no Hilbert cross-hatch).
 - A scipy-cKDTree fast path for the BFS distance hotspot — single plate runtime down ~4.4× from baseline. A 10-plate `.3mf` (~660 MB unzipped) processes in ~60 seconds wall-time.
 
 ## Setup
@@ -63,10 +65,15 @@ Bridges that don't qualify are left as-is. For bridges that qualify:
 ## CLI knobs
 
 ```
---arc-speed FLOAT             Arc print speed mm/s. Default 5.
+--arc-speed FLOAT             Arc print speed mm/s. Default = the slicer's
+                              bridge_speed (from CONFIG_BLOCK). Tune the bridge
+                              profile in Bambu Studio and the arcs follow.
+                              Pass an explicit value to override.
 --arc-min-speed FLOAT         Floor speed for short arcs that the BFS slows
-                              down (small radii get extra cooling time).
-                              Default 2 mm/s. Upstream default is 0.5.
+                              down. Default = --arc-speed (no slowdown — arcs
+                              print at bridge_speed regardless of length).
+                              Set explicitly to enable per-arc slowdown for
+                              small radii.
 --min-top-coverage FLOAT      Min fraction of bridge area under solid in next
                               layer (0..1). Default 0.5. Set 0 to disable.
 --bridge-closing FLOAT        Closing-operation radius (mm) applied to bridge
@@ -128,10 +135,10 @@ If "truly unsupported" is non-zero on a load-bearing layer, options are:
 
 The arc-overhang technique relies on each filament strand cooling before the next is laid on top of it. Recommended settings in Bambu Studio for parts where this matters:
 
-- Part fan at 100% on the layer with arcs.
+- Part fan is forced to 100% on the layer with arcs (the script always emits `M106 S255` regardless of slicer profile).
 - Lower nozzle temp than usual (PLA at ~190 °C works well).
 - The script disables Bambu Studio's slicer-side bridging slowdown above arcs by default. If you want it back, use `--above-arcs-zdist 3`.
-- Bridge speed in your Bambu profile applies to the *preserved* bridge segments. Keep it ≤ 10 mm/s if your part has thin bridge regions; the arcs themselves are at `--arc-speed` (default 5 mm/s).
+- **Bridge speed in your Bambu profile drives both the *preserved* bridge segments and the *arcs themselves* by default.** Set it ≤ 10 mm/s if your part has thin bridge regions. Pass `--arc-speed N` to override only the arc speed without touching the slicer profile.
 
 ## Performance
 

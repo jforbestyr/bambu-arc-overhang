@@ -116,14 +116,14 @@ def makeFullSettingDict(gCodeSettingDict: dict) -> dict:
         "AllowedSpaceForArcs": Polygon([[0, 0], [500, 0], [500, 500], [0, 500]]),  # Control in which areas Arcs shall be generated
         "ArcCenterOffset": 1.5 * gCodeSettingDict.get("nozzle_diameter"),  # Unit: mm, prevents very small Arcs by hiding the center in not printed section. Make 0 to get into tricky spots with smaller arcs.
         "ArcExtrusionMultiplier": 1.35, # Multiplies how much filament will be extruded while printing arcs.
-        "ArcFanSpeed": 255,  # Cooling to full blast = 255
-        "ArcMinPrintSpeed": 0.5 * 60,  # Unit: mm/min
-        "ArcPrintSpeed": 1.5 * 60,  # Unit: mm/min
+        "ArcFanSpeed": 255,  # Cooling to full blast = 255. Always overridden in arc block; arcs need maximum cooling regardless of slicer fan profile.
+        "ArcMinPrintSpeed": None,  # Unit: mm/min. None => fall back to the slicer's bridge_speed (so arcs honor the slicer profile by default).
+        "ArcPrintSpeed": None,  # Unit: mm/min. None => fall back to the slicer's bridge_speed.
         "UseCustomArcTemp": False, # Set to True to use a custom arc printing temperature
         "CustomArcTemp": 200, # The temperature (in °C) to wait for before printing arcs
         "ArcSlowDownBelowThisDuration": 3,  # Arc Time below this Duration => slow down, Unit: sec
         "ArcPointsPerMillimeter": 10,  # Higher will slow down the code but give better support for following arcs. Recommended values: >=10 when "UseLeastAmountOfCenterPoints": False; else, value can be as low as 1.
-        "ArcTravelFeedRate": 30 * 60,  # Slower travel speed, Unit: mm/min
+        "ArcTravelFeedRate": None,  # mm/min. None => fall back to the slicer's travel_speed.
         "ZHopOnArcTravel": True,  # Master toggle for z-hop on retracted travels in injected arc/preserved-bridge gcode.
         "ZHopHeight": None,  # mm. None => use the slicer-extracted z_hop. 0 disables.
         "ZHopFeedRate": 12000,  # mm/min, Bambu's typical Auto-Lift speed.
@@ -224,6 +224,8 @@ _SLICER_SETTINGS_MAP = {
     'PrusaSlicer': {
         "avoid_crossing_perimeters": "avoid_crossing_perimeters",
         "bridge_speed": "bridge_speed",
+        "bridge_acceleration": "bridge_acceleration",
+        "default_acceleration": "default_acceleration",
         "external_perimeters_first": "external_perimeters_first",
         'extrusion_width': 'extrusion_width',
         "filament_diameter": "filament_diameter",
@@ -246,6 +248,8 @@ _SLICER_SETTINGS_MAP = {
     'OrcaSlicer': {
         "reduce_crossing_wall": "avoid_crossing_perimeters",
         "bridge_speed": "bridge_speed",
+        "bridge_acceleration": "bridge_acceleration",
+        "default_acceleration": "default_acceleration",
         #"wall_sequence": "external_perimeters_first", SETTING HANDLED DIFFERENTLY, STORE AS DEFAULT NAME:
         "wall_sequence": "wall_sequence",
         'line_width': 'extrusion_width',
@@ -654,6 +658,16 @@ def main(gCodeFileStream, path2GCode) -> None:
                                 # Wait for the custom temperature before beginning arcs.
                                 modifiedlayer.lines.append(f"M109 S{parameters.get('CustomArcTemp')} ; Wait for custom arc temp\n")
                             modifiedlayer.lines.append(f"M106 S{parameters.get('ArcFanSpeed')}\n")
+                            # Honor the slicer's bridge acceleration so arcs aren't running with whatever M204 the
+                            # previous feature left set. Bambu doesn't expose a separate bridge_acceleration —
+                            # default_acceleration is what its bridge feature actually runs at — so fall back to that.
+                            arc_accel = parameters.get("bridge_acceleration") or parameters.get("default_acceleration")
+                            try:
+                                arc_accel = int(round(float(arc_accel))) if arc_accel else 0
+                            except (TypeError, ValueError):
+                                arc_accel = 0
+                            if arc_accel > 0:
+                                modifiedlayer.lines.append(f"M204 S{arc_accel}\n")
                             for overhangline in arcOverhangGCode:
                                 for arcline in overhangline:
                                     for cmdline in arcline:
@@ -2105,8 +2119,20 @@ def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, z_print=None, kwa
     extDist = kwargs.get("ExtendArcDist", 0.5)  # Get tangential extension distance
     pExtendBegin = move_toward_point(pts[0], pts[1], extDist, -90)  # Extend the arc tangentially
     pExtendEnd = move_toward_point(pts[-1], pts[-2], extDist, 90)  # Extend the arc tangentially
+    # Speed/travel default to the slicer's bridge_speed / travel_speed when the user hasn't overridden them.
+    arcMaxF = kwargs.get("ArcPrintSpeed")
+    if arcMaxF is None:
+        bs = float(kwargs.get("bridge_speed", 0) or 0)
+        arcMaxF = bs * 60 if bs > 0 else 1.5 * 60
+    arcMinF = kwargs.get("ArcMinPrintSpeed")
+    if arcMinF is None:
+        arcMinF = arcMaxF
+    travelF = kwargs.get("ArcTravelFeedRate")
+    if travelF is None:
+        ts = float(kwargs.get("travel_speed", 0) or 0)
+        travelF = ts * 60 if ts > 0 else 100 * 60
     arcPrintSpeed = np.clip(arcline.length / (kwargs.get("ArcSlowDownBelowThisDuration", 3)) * 60,
-                            kwargs.get("ArcMinPrintSpeed", 1 * 60), kwargs.get('ArcPrintSpeed', 2 * 60))  # Calculate print speed
+                            arcMinF, arcMaxF)  # Calculate print speed
 
     for idp, p in enumerate(pts):
         if idp == 0:
@@ -2116,7 +2142,7 @@ def arc2GCode(arcline: LineString, eSteps: float, arcidx=None, z_print=None, kwa
             dist=distance(pExtendBegin, p)
             p1 = p
             GCodeLines.append(f";Arc {arcidx if arcidx else ' '} Length:{arcline.length}\n")
-            GCodeLines.append(p2GCode(pExtendBegin, F=kwargs.get('ArcTravelFeedRate', 100 * 60)))
+            GCodeLines.append(p2GCode(pExtendBegin, F=int(travelF)))
             GCodeLines.extend(zHopGCode(False, z_print, kwargs))
             GCodeLines.append(p2GCode(p, E=dist * eSteps))
             GCodeLines.append(retractGCode(retract=False, kwargs=kwargs))
@@ -2165,7 +2191,12 @@ def preservedBridgeGCode(kept, parameters: dict, z_print=None) -> list:
 
     bridge_speed_mm_s = float(parameters.get("bridge_speed", 5) or 5)
     bridge_F = max(60, int(bridge_speed_mm_s * 60))
-    travel_F = int(parameters.get("ArcTravelFeedRate", 1800))
+    travel_F = parameters.get("ArcTravelFeedRate")
+    if travel_F is None:
+        ts = float(parameters.get("travel_speed", 0) or 0)
+        travel_F = int(ts * 60) if ts > 0 else 1800
+    else:
+        travel_F = int(travel_F)
 
     min_travel = parameters.get("RetractionMinTravel")
     if min_travel is None:
@@ -2217,12 +2248,16 @@ def hilbert2GCode(allhilbertpts: list, parameters: dict, layerheight: float):
     """Generates G-code for a 3D printer based on a list of Hilbert curve points."""
     hilbertGCode = []  # Initialize an empty list to store the generated G-code
     eSteps = calcESteps(parameters, layerheight)  # Calculate extrusion steps based on parameters and layer height
+    travelF = parameters.get("ArcTravelFeedRate")
+    if travelF is None:
+        ts = float(parameters.get("travel_speed", 0) or 0)
+        travelF = int(ts * 60) if ts > 0 else 100 * 60
 
     for idc, curvepts in enumerate(allhilbertpts):
         for idp, p in enumerate(curvepts):
             if idp == 0:
                 # Move to the first point of the curve without extruding
-                hilbertGCode.append(p2GCode(p, F=parameters.get("ArcTravelFeedRate")))
+                hilbertGCode.append(p2GCode(p, F=travelF))
                 if idc == 0:
                     # Extrude filament before starting the first curve
                     hilbertGCode.append(retractGCode(False, parameters))
