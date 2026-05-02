@@ -100,8 +100,8 @@ Bridges that don't qualify are left as-is. For bridges that qualify:
                               Requires --above-arcs-zdist > 0. Off by default.
 --fan-boost-whole-layer       If above-arcs cooling is on, force fan boost
                               across whole layers near arcs.
---workers INT                 Max plates to process in parallel. Default = CPU
-                              count.
+--workers INT                 Max plates to process in parallel. Default =
+                              one worker per plate. Pass an integer to cap it.
 -o OUTPUT                     Output .3mf path. Default: <input>_arc.3mf.
 ```
 

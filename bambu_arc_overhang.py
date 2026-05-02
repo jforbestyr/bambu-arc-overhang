@@ -275,7 +275,8 @@ def process_3mf(in_3mf: Path, out_3mf: Path, settings: Settings, workers: int) -
             sys.exit("No Metadata/plate_*.gcode found in archive.")
 
         n = len(gcode_files)
-        actual_workers = max(1, min(workers, n))
+        # Default (workers=None) = one worker per plate. Explicit --workers caps it.
+        actual_workers = max(1, n if workers is None else min(workers, n))
         print(f"Processing {n} plate(s) with {actual_workers} worker(s)...")
 
         with ThreadPoolExecutor(max_workers=actual_workers) as ex:
@@ -386,8 +387,9 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=os.cpu_count() or 1,
-        help="Max plates to process in parallel. Defaults to CPU count.",
+        default=None,
+        help="Max plates to process in parallel. Default = one worker per plate "
+        "(every plate runs concurrently). Pass an integer to cap it.",
     )
     args = parser.parse_args()
 
