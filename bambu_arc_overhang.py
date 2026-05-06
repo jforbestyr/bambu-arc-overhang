@@ -53,6 +53,19 @@ ORCA_TO_BAMBU = [(b, a) for a, b in BAMBU_TO_ORCA]
 
 FEATURE_RE = re.compile(r"^; FEATURE: (.+)$")
 TYPE_RE = re.compile(r"^;TYPE:(.+)$")
+PLATE_NUM_RE = re.compile(r"^Metadata/plate_(\d+)\.gcode$")
+
+# Bambu Studio's send_gcode short-circuits and uploads the entire .3mf when
+# m_exported_file is true (set whenever a gcode-only .gcode.3mf — i.e. one
+# whose 3D/3dmodel.model has empty <resources> — is loaded). For a multi-
+# plate archive this means picking plate N and clicking "Send to printer"
+# uploads ALL plates' gcode (hundreds of MB), not just the chosen plate.
+# Workaround: we also emit one single-plate .gcode.3mf per plate so the
+# user can upload an individual plate without touching the multi-plate
+# archive. The single-plate file looks like Bambu's own per-plate export
+# (gcode renumbered to plate_1, sidecar metadata trimmed to one plate),
+# which keeps the upload payload to one plate's gcode.
+ZIP_COMPRESSLEVEL = 1  # zlib level 1: ~3-5x faster than default (6) on big gcode, ~10-15% larger.
 
 # Type names the post-processor invents that Bambu Studio's gcode preview
 # does not recognize. These get renamed to a known Bambu feature on the way
@@ -260,9 +273,205 @@ def process_one_plate(
     return label, time.perf_counter() - t0, modified, coverage_lines
 
 
-def process_3mf(in_3mf: Path, out_3mf: Path, settings: Settings, workers: int) -> None:
+def derive_multi_plate_output(in_3mf: Path) -> Path:
+    """`<name>.gcode.3mf` -> `<name>_arc.gcode.3mf` (preserve double extension);
+    other inputs keep single-extension behavior."""
+    name = in_3mf.name
+    if name.endswith(".gcode.3mf"):
+        return in_3mf.with_name(name[: -len(".gcode.3mf")] + "_arc.gcode.3mf")
+    return in_3mf.with_name(in_3mf.stem + "_arc" + in_3mf.suffix)
+
+
+def derive_per_plate_output(base_out: Path, plate_idx: int) -> Path:
+    name = base_out.name
+    if name.endswith(".gcode.3mf"):
+        return base_out.with_name(
+            name[: -len(".gcode.3mf")] + f"_plate_{plate_idx}.gcode.3mf"
+        )
+    return base_out.with_name(base_out.stem + f"_plate_{plate_idx}" + base_out.suffix)
+
+
+def plate_specific_files(n: int) -> list[str]:
+    """Files in the .3mf that are tied to plate `n`."""
+    return [
+        f"Metadata/plate_{n}.gcode",
+        f"Metadata/plate_{n}.gcode.md5",
+        f"Metadata/plate_{n}.png",
+        f"Metadata/plate_{n}_small.png",
+        f"Metadata/plate_{n}.json",
+        f"Metadata/plate_no_light_{n}.png",
+        f"Metadata/top_{n}.png",
+        f"Metadata/pick_{n}.png",
+    ]
+
+
+def renumber_plate_path(name: str, src_n: int, dst_n: int) -> str:
+    """Rewrite a plate-`src_n` path to the equivalent plate-`dst_n` path."""
+    if src_n == dst_n:
+        return name
+    table = dict(zip(plate_specific_files(src_n), plate_specific_files(dst_n)))
+    return table.get(name, name)
+
+
+def renumber_plate_text(text: str, src_n: int, dst_n: int) -> str:
+    """Rewrite plate-`src_n` filename references inside an XML/config file
+    so they point at plate `dst_n` instead. Operates on the textual file
+    format so we keep the original whitespace/formatting Bambu emits."""
+    if src_n == dst_n:
+        return text
+    for src, dst in zip(plate_specific_files(src_n), plate_specific_files(dst_n)):
+        # Strip leading "Metadata/" so we also match references that omit the
+        # directory prefix (e.g. inside thumbnail attributes).
+        text = text.replace(src, dst)
+        text = text.replace(src[len("Metadata/") :], dst[len("Metadata/") :])
+    return text
+
+
+_PLATE_BLOCK_RE = re.compile(r"  <plate>\n.*?\n  </plate>\n", re.DOTALL)
+
+
+def filter_xml_to_one_plate(text: str, plate_idx: int, key: str) -> str:
+    """Drop every `<plate>...</plate>` block whose `<metadata key="<key>" value="N"/>`
+    differs from `plate_idx`, and renumber the kept block's value to 1.
+
+    `key` is "plater_id" for model_settings.config, "index" for slice_info.config."""
+    target_value_re = re.compile(rf'key="{key}" value="(\d+)"')
+
+    def keep(m: re.Match) -> str:
+        block = m.group(0)
+        id_m = target_value_re.search(block)
+        if id_m and int(id_m.group(1)) == plate_idx:
+            return target_value_re.sub(f'key="{key}" value="1"', block, count=1)
+        return ""
+
+    return _PLATE_BLOCK_RE.sub(keep, text)
+
+
+def filter_rels_to_one_plate(text: str, plate_idx: int) -> str:
+    """Drop every <Relationship .../> entry that targets a different plate's
+    gcode, and renumber the surviving target/id to plate 1."""
+    target = f"/Metadata/plate_{plate_idx}.gcode"
+
+    def keep(m: re.Match) -> str:
+        line = m.group(0)
+        if f'Target="{target}"' in line:
+            return (
+                line.replace(target, "/Metadata/plate_1.gcode")
+                .replace(f'Id="rel-{plate_idx}"', 'Id="rel-1"')
+            )
+        return ""
+
+    return re.sub(r" <Relationship\b[^>]*/>\n", keep, text)
+
+
+def write_multi_plate_3mf(
+    in_3mf: Path,
+    td_path: Path,
+    out_path: Path,
+) -> None:
+    """Repack td_path back into a multi-plate .3mf, preserving entry order
+    and per-entry compression type from the source archive."""
+    with zipfile.ZipFile(in_3mf, "r") as zin:
+        entry_order = [info.filename for info in zin.infolist()]
+        entry_compress = {info.filename: info.compress_type for info in zin.infolist()}
+
+    with zipfile.ZipFile(
+        out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=ZIP_COMPRESSLEVEL
+    ) as zout:
+        for name in entry_order:
+            src = td_path / name
+            if not src.exists():
+                continue
+            zout.write(
+                src, name, compress_type=entry_compress.get(name, zipfile.ZIP_DEFLATED)
+            )
+
+
+def write_single_plate_3mf(
+    in_3mf: Path,
+    td_path: Path,
+    plate_idx: int,
+    out_path: Path,
+) -> None:
+    """Build a single-plate .gcode.3mf containing only plate `plate_idx`'s
+    files (renumbered to plate_1) and the shared project metadata, with the
+    sidecar XMLs trimmed to reference just that one plate."""
+    with zipfile.ZipFile(in_3mf, "r") as zin:
+        entry_order = [info.filename for info in zin.infolist()]
+        entry_compress = {info.filename: info.compress_type for info in zin.infolist()}
+
+    drop = set()  # other plates' files
+    src_to_dst = {}  # rename plate_{plate_idx}.* -> plate_1.*
+    for name in entry_order:
+        m = PLATE_NUM_RE.match(name)
+        # We use the gcode list to enumerate plates; the same index applies
+        # to all plate-specific files. Detect any plate-specific file by
+        # checking the full set across all plates we know about.
+        if name in plate_specific_files(plate_idx):
+            src_to_dst[name] = renumber_plate_path(name, plate_idx, 1)
+            continue
+        # If this file belongs to some plate other than `plate_idx`, drop it.
+        if name.startswith("Metadata/"):
+            for n in range(1, len(entry_order) + 1):
+                if name in plate_specific_files(n):
+                    drop.add(name)
+                    break
+        del m  # silence linter
+
+    rewrites: dict[str, str] = {}
+    ms_path = td_path / "Metadata/model_settings.config"
+    si_path = td_path / "Metadata/slice_info.config"
+    rels_path = td_path / "Metadata/_rels/model_settings.config.rels"
+    if ms_path.exists():
+        rewrites["Metadata/model_settings.config"] = renumber_plate_text(
+            filter_xml_to_one_plate(
+                ms_path.read_text(encoding="utf-8"), plate_idx, "plater_id"
+            ),
+            plate_idx,
+            1,
+        )
+    if si_path.exists():
+        rewrites["Metadata/slice_info.config"] = renumber_plate_text(
+            filter_xml_to_one_plate(
+                si_path.read_text(encoding="utf-8"), plate_idx, "index"
+            ),
+            plate_idx,
+            1,
+        )
+    if rels_path.exists():
+        rewrites["Metadata/_rels/model_settings.config.rels"] = filter_rels_to_one_plate(
+            rels_path.read_text(encoding="utf-8"), plate_idx
+        )
+
+    with zipfile.ZipFile(
+        out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=ZIP_COMPRESSLEVEL
+    ) as zout:
+        for name in entry_order:
+            if name in drop:
+                continue
+            ctype = entry_compress.get(name, zipfile.ZIP_DEFLATED)
+            if name in rewrites:
+                zout.writestr(name, rewrites[name], compress_type=ctype)
+                continue
+            dst_name = src_to_dst.get(name, name)
+            src = td_path / name
+            if not src.exists():
+                continue
+            zout.write(src, dst_name, compress_type=ctype)
+
+
+def process_3mf(
+    in_3mf: Path,
+    out_3mf: Path,
+    settings: Settings,
+    workers: int,
+    emit_multi_plate: bool,
+    emit_per_plate: bool,
+) -> None:
     if in_3mf.resolve() == out_3mf.resolve():
         sys.exit("Input and output paths must differ.")
+    if not (emit_multi_plate or emit_per_plate):
+        sys.exit("Both --no-multi-plate and --no-per-plate set: nothing to do.")
 
     overall = time.perf_counter()
     with tempfile.TemporaryDirectory() as td:
@@ -273,6 +482,12 @@ def process_3mf(in_3mf: Path, out_3mf: Path, settings: Settings, workers: int) -
         gcode_files = sorted(td_path.glob("Metadata/plate_*.gcode"))
         if not gcode_files:
             sys.exit("No Metadata/plate_*.gcode found in archive.")
+
+        plate_indices: list[int] = []
+        for gp in gcode_files:
+            m = PLATE_NUM_RE.match(gp.relative_to(td_path).as_posix())
+            if m:
+                plate_indices.append(int(m.group(1)))
 
         n = len(gcode_files)
         # Default (workers=None) = one worker per plate. Explicit --workers caps it.
@@ -290,20 +505,49 @@ def process_3mf(in_3mf: Path, out_3mf: Path, settings: Settings, workers: int) -
                 for cov_line in coverage_lines:
                     print(f"    {cov_line}")
 
-        with zipfile.ZipFile(in_3mf, "r") as zin:
-            entry_order = [info.filename for info in zin.infolist()]
-            entry_compress = {info.filename: info.compress_type for info in zin.infolist()}
-
-        with zipfile.ZipFile(out_3mf, "w") as zout:
-            for name in entry_order:
-                src = td_path / name
-                if not src.exists():
-                    continue
-                zout.write(
-                    src, name, compress_type=entry_compress.get(name, zipfile.ZIP_DEFLATED)
+        # Pack output(s). The big cost is deflating the modified gcode files,
+        # so write per-plate outputs in parallel — each output is an
+        # independent ZipFile, and one plate's gcode is small enough that
+        # level=1 deflate is bound by I/O, not CPU.
+        export_t0 = time.perf_counter()
+        write_jobs: list[tuple[str, Path, callable]] = []
+        if emit_multi_plate:
+            write_jobs.append(
+                (
+                    f"multi-plate {out_3mf.name}",
+                    out_3mf,
+                    lambda p=out_3mf: write_multi_plate_3mf(in_3mf, td_path, p),
+                )
+            )
+        if emit_per_plate and (n > 1 or not emit_multi_plate):
+            # For a single-plate input, the multi-plate file IS the per-plate
+            # file (modulo renumbering which is a no-op for plate_1) so we
+            # don't bother emitting a duplicate. If the user disabled
+            # multi-plate, emit the per-plate even when n == 1.
+            for idx in plate_indices:
+                pp_out = derive_per_plate_output(out_3mf, idx)
+                write_jobs.append(
+                    (
+                        f"plate {idx} -> {pp_out.name}",
+                        pp_out,
+                        lambda i=idx, p=pp_out: write_single_plate_3mf(
+                            in_3mf, td_path, i, p
+                        ),
+                    )
                 )
 
-    print(f"\nWrote: {out_3mf}  (total {time.perf_counter() - overall:.1f}s)")
+        with ThreadPoolExecutor(max_workers=min(actual_workers, len(write_jobs))) as ex:
+            futures = {ex.submit(job): label for (label, _, job) in write_jobs}
+            for fut in as_completed(futures):
+                fut.result()  # propagate exceptions
+        export_secs = time.perf_counter() - export_t0
+
+    print(
+        f"\nWrote {len(write_jobs)} file(s) in {export_secs:.1f}s "
+        f"(total {time.perf_counter() - overall:.1f}s):"
+    )
+    for label, path, _ in write_jobs:
+        print(f"  {path}")
 
 
 def main() -> None:
@@ -391,13 +635,30 @@ def main() -> None:
         help="Max plates to process in parallel. Default = one worker per plate "
         "(every plate runs concurrently). Pass an integer to cap it.",
     )
+    parser.add_argument(
+        "--no-multi-plate",
+        dest="emit_multi_plate",
+        action="store_false",
+        help="Skip writing the multi-plate <name>_arc.gcode.3mf. Per-plate "
+        "single-plate files are still written (use --no-per-plate to skip those).",
+    )
+    parser.add_argument(
+        "--no-per-plate",
+        dest="emit_per_plate",
+        action="store_false",
+        help="Skip writing the per-plate <name>_arc_plate_N.gcode.3mf files. "
+        "Bambu Studio uploads the entire .3mf when you Send-to-Printer from a "
+        "multi-plate gcode 3MF; the per-plate files exist so each upload is a "
+        "single plate. Pass this only if you don't plan to print from these.",
+    )
+    parser.set_defaults(emit_multi_plate=True, emit_per_plate=True)
     args = parser.parse_args()
 
     in_3mf: Path = args.input.expanduser()
     if not in_3mf.exists():
         sys.exit(f"Input not found: {in_3mf}")
 
-    out_3mf: Path = args.output or in_3mf.with_name(in_3mf.stem + "_arc.3mf")
+    out_3mf: Path = args.output or derive_multi_plate_output(in_3mf)
 
     settings = Settings(
         arc_speed_mm_s=args.arc_speed,
@@ -410,7 +671,14 @@ def main() -> None:
         hilbert_cooling=args.enable_hilbert_cooling,
         fan_boost_whole_layer=args.fan_boost_whole_layer,
     )
-    process_3mf(in_3mf, out_3mf, settings, args.workers)
+    process_3mf(
+        in_3mf,
+        out_3mf,
+        settings,
+        args.workers,
+        emit_multi_plate=args.emit_multi_plate,
+        emit_per_plate=args.emit_per_plate,
+    )
 
 
 if __name__ == "__main__":

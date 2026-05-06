@@ -34,7 +34,14 @@ pip install -r requirements.txt
 .venv/bin/python bambu_arc_overhang.py <plate.3mf>
 ```
 
-Output is written next to the input as `<name>_arc.3mf`. Multi-plate `.3mf` files (Bambu Studio "Send all to printer" / "Export all plates") are auto-detected and each plate is processed in parallel.
+For an input named `<name>.gcode.3mf` the script writes:
+
+- `<name>_arc.gcode.3mf` — multi-plate, for previewing all plates in one Bambu Studio session.
+- `<name>_arc_plate_N.gcode.3mf` (one per plate) — single-plate, for **uploading** to a printer.
+
+Use the per-plate file when sending to a printer. Bambu Studio's `Send to printer` short-circuits and uploads the entire loaded `.3mf` whenever it sees a gcode-only archive (`m_exported_file == true` in [`Plater::send_gcode`](https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/Plater.cpp)), so a multi-plate archive uploads ALL plates regardless of which one you select. The single-plate files are renumbered to `plate_1` and have their `model_settings.config` / `slice_info.config` / `_rels/model_settings.config.rels` trimmed to one plate, so each upload is just that plate's gcode.
+
+Pass `--no-multi-plate` or `--no-per-plate` to skip either side. Multi-plate `.3mf` files (Bambu Studio "Send all to printer" / "Export all plates") are auto-detected and each plate is processed in parallel.
 
 ```sh
 # basic
@@ -102,7 +109,16 @@ Bridges that don't qualify are left as-is. For bridges that qualify:
                               across whole layers near arcs.
 --workers INT                 Max plates to process in parallel. Default =
                               one worker per plate. Pass an integer to cap it.
--o OUTPUT                     Output .3mf path. Default: <input>_arc.3mf.
+--no-multi-plate              Skip writing the multi-plate <name>_arc.gcode.3mf.
+--no-per-plate                Skip writing the per-plate
+                              <name>_arc_plate_N.gcode.3mf files. Bambu Studio
+                              uploads the entire .3mf when you Send-to-Printer
+                              from a multi-plate gcode 3MF; the per-plate files
+                              exist so each upload is one plate.
+-o OUTPUT                     Multi-plate output path. Default:
+                              <input-name-with-extension>_arc.gcode.3mf.
+                              Per-plate files derive from this by inserting
+                              _plate_N before the extension.
 ```
 
 ## Coverage diagnostic
@@ -145,15 +161,20 @@ The arc-overhang technique relies on each filament strand cooling before the nex
 | Workload | Wall time |
 |---|---|
 | Single plate, 12 MB gcode, 6 bridge layers | ~11 s |
-| 10-plate `.3mf`, ~660 MB unzipped, parallel | ~60 s |
-| 8-plate `.3mf`, ~410 MB unzipped, parallel | ~32 s |
+| 10-plate `.3mf`, ~660 MB unzipped, parallel | ~26 s |
+| 8-plate `.3mf`, ~410 MB unzipped, parallel | ~22 s |
 
 The biggest hotspot was per-point shapely.distance during the BFS — replaced with a cKDTree query against a densified copy of the polygon boundary, which gave a ~4.4× speedup on the test plate. Bambu Studio's slicer can re-slice the same input in ~4 s; we're ~2.5–3× behind their C++ pipeline. Most of the remaining time is inside shapely's `intersection` / `intersects` / `buffer` calls, which are inherent to the BFS algorithm.
+
+The repack step uses zlib level 1 (vs. the Python default 6) and writes the multi-plate and per-plate files in parallel via `ThreadPoolExecutor`. On the 10-plate test that dropped repack time from ~18 s to ~5 s; output `.3mf` is ~10–15% larger but transfer-time-equivalent since printers read the file once and decompression is cheap. Wall time is bounded by the slowest single plate (parallelism stops at one core per plate); an intra-plate split would be possible but isn't currently implemented.
 
 ## Architecture
 
 ```
-bambu_arc_overhang.py    # .3mf wrapper, multi-plate, marker translation, md5 refresh
+bambu_arc_overhang.py    # .3mf wrapper: multi-plate processing, marker
+                         # translation, md5 refresh, parallel repack, and
+                         # per-plate single-plate .gcode.3mf emission so
+                         # Send-to-Printer uploads one plate at a time.
 arc_overhangs_v1.0.0.py  # post-processor (forked from upstream).
                          # Modifications:
                          #  - OnlyBridgesSupportingTopSurfaces filter
