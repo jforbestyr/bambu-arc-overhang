@@ -43,6 +43,31 @@ Use the per-plate file when sending to a printer. Bambu Studio's `Send to printe
 
 Pass `--no-multi-plate` or `--no-per-plate` to skip either side. Multi-plate `.3mf` files (Bambu Studio "Send all to printer" / "Export all plates") are auto-detected and each plate is processed in parallel.
 
+### Auto-run as a Bambu Studio post-processing script
+
+Bambu Studio can run external scripts on each plate's G-code at slice time. The script is invoked once per plate, the slicer's temp `.gcode` path is appended as the last argument, and the script must **modify the file in place** (see `libslic3r/GCode/PostProcessor.cpp::run_post_process_scripts`). When the input is a raw `.gcode` file (not a `.3mf`), `bambu_arc_overhang.py` enters in-place mode automatically.
+
+To enable:
+
+1. In Bambu Studio, open the **Process** preset → **Others** tab → **Post-processing scripts**.
+2. Paste this into the textarea (one script per line):
+
+   ```
+   /absolute/path/to/repo/.venv/bin/python /absolute/path/to/repo/bambu_arc_overhang.py
+   ```
+
+   Add CLI flags after the script path the same way you would on the command line, e.g. `--arc-speed 5 --min-top-coverage 0.7`. **Don't quote the gcode path** — Bambu appends it itself.
+
+3. Save the preset (the modified-preset indicator appears next to the preset name).
+
+Caveats:
+
+- Slicing time goes up by however long `bambu_arc_overhang.py` would take on that plate's gcode (~3–20 s per plate, depending on bridge complexity).
+- The setting lives on the active Process preset. Add it to every Process preset you slice with.
+- After post-processing, Bambu re-parses the gcode for the preview. There's an upstream bug where this re-parse path breaks the H2C/H2D nozzle auto-mapping table (`The printer failed to build the nozzle auto-mapping table`); X1/P1 are unaffected. See the comment block in `BackgroundSlicingProcess.cpp::finalize_gcode`.
+- Auto-running the post-processor produces a multi-plate `.gcode.3mf` on export, which still uploads the entire archive on Send-to-Printer. Use the wrapper's `.3mf` mode (see above) afterward to emit per-plate uploadable files, or skip post-processing in Bambu and process the exported `.gcode.3mf` end-to-end with this script.
+- The first slice after a script is configured shows a security-warning modal listing the script text. Click **Yes** to run, **No** to skip post-processing for that session, or close the dialog to cancel the slice. The choice is remembered until the project is closed.
+
 ```sh
 # basic
 .venv/bin/python bambu_arc_overhang.py /path/to/plate.3mf

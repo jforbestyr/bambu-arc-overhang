@@ -550,10 +550,52 @@ def process_3mf(
         print(f"  {path}")
 
 
+def process_gcode_in_place(gcode_path: Path, settings: Settings) -> None:
+    """Bambu Studio's `post_process` script hook (Process preset -> Others ->
+    Post-processing scripts) hands the slicer's temp .gcode file to each
+    configured script and requires the script to MODIFY THE FILE IN PLACE.
+    See libslic3r/GCode/PostProcessor.cpp::run_post_process_scripts.
+
+    This entrypoint is the wrapper's gcode mode: translate Bambu markers to
+    Orca, run arc_overhangs_v1.0.0.py, translate back, overwrite the input."""
+    overall = time.perf_counter()
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        shim_in = td_path / (gcode_path.stem + "_orca_in.gcode")
+        shim_out = td_path / (gcode_path.stem + "_orca_out.gcode")
+        original_text = gcode_path.read_text(encoding="utf-8")
+        shim_in.write_text(bambu_to_orca(original_text), encoding="utf-8")
+        stdout = run_post_processor(shim_in, shim_out, settings)
+        for line in (stdout or "").splitlines():
+            if (
+                line.startswith("Coverage:")
+                or line.startswith("  Layers with")
+                or line.startswith("    layer ")
+                or "rejecting poly" in line
+            ):
+                print(f"  {line}")
+
+        modified = shim_out.exists() and shim_out.stat().st_size > 0
+        if modified:
+            modified_text = shim_out.read_text(encoding="utf-8")
+            final_text = orca_to_bambu(modified_text)
+            gcode_path.write_text(final_text, encoding="utf-8")
+            tag = "modified in place"
+        else:
+            tag = "no qualifying bridges; unchanged"
+    print(f"[{time.perf_counter() - overall:.1f}s] {gcode_path}: {tag}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("input", type=Path, help="Path to input .3mf")
-    parser.add_argument("-o", "--output", type=Path, default=None, help="Output .3mf path")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to input. .3mf -> wrapper mode (extract plates, process, "
+        "repack). .gcode -> in-place mode (for use as a Bambu Studio "
+        "Process > Others > Post-processing script).",
+    )
+    parser.add_argument("-o", "--output", type=Path, default=None, help="Output .3mf path (ignored in .gcode in-place mode)")
     parser.add_argument(
         "--arc-speed",
         type=float,
@@ -654,11 +696,9 @@ def main() -> None:
     parser.set_defaults(emit_multi_plate=True, emit_per_plate=True)
     args = parser.parse_args()
 
-    in_3mf: Path = args.input.expanduser()
-    if not in_3mf.exists():
-        sys.exit(f"Input not found: {in_3mf}")
-
-    out_3mf: Path = args.output or derive_multi_plate_output(in_3mf)
+    in_path: Path = args.input.expanduser()
+    if not in_path.exists():
+        sys.exit(f"Input not found: {in_path}")
 
     settings = Settings(
         arc_speed_mm_s=args.arc_speed,
@@ -671,8 +711,14 @@ def main() -> None:
         hilbert_cooling=args.enable_hilbert_cooling,
         fan_boost_whole_layer=args.fan_boost_whole_layer,
     )
+
+    if in_path.suffix.lower() == ".gcode":
+        process_gcode_in_place(in_path, settings)
+        return
+
+    out_3mf: Path = args.output or derive_multi_plate_output(in_path)
     process_3mf(
-        in_3mf,
+        in_path,
         out_3mf,
         settings,
         args.workers,
